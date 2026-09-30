@@ -2958,7 +2958,7 @@ function localApiDevPlugin(): Plugin {
 
           const chunks: Buffer[] = [];
           req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-          return req.on('end', () => {
+          return req.on('end', async () => {
             try {
               const fullBuffer = Buffer.concat(chunks);
               const contentType = req.headers['content-type'] || '';
@@ -3017,6 +3017,20 @@ function localApiDevPlugin(): Plugin {
               const key = generateSafeMediaKey(validation.extension);
               devMedia.set(key, { buffer: fileBuffer, contentType: verifiedMime });
 
+              // Pre-generate standard responsive variants (240, 360, 480, 720, 1080)
+              try {
+                const sharpModule = await import('sharp');
+                const sharp = (sharpModule as any).default || sharpModule;
+                const baseKeyWithoutExt = key.replace(/\.[^.]+$/, '');
+                const standardWidths = [240, 360, 480, 720, 1080];
+                for (const w of standardWidths) {
+                  const webpBuf = await sharp(fileBuffer).resize(w, null, { withoutEnlargement: true, fit: 'inside' }).webp({ quality: 82 }).toBuffer();
+                  devMedia.set(`${baseKeyWithoutExt}_w${w}.webp`, { buffer: webpBuf, contentType: 'image/webp' });
+                }
+              } catch (e) {
+                console.warn('Dev variant pre-generation error:', e);
+              }
+
               // Record successful upload in per-user rate limiters
               recordDevRateAttempt(burstKey, 60);
               recordDevRateAttempt(hourKey, 3600);
@@ -3047,27 +3061,60 @@ function localApiDevPlugin(): Plugin {
             return res.end('Invalid media asset key');
           }
           const key = rawKey;
+          const widthParam = url.searchParams.get('w') || url.searchParams.get('width');
+          const targetWidth = widthParam ? parseInt(widthParam, 10) : null;
+          const qualityParam = url.searchParams.get('q') || url.searchParams.get('quality');
+          const targetQuality = qualityParam ? Math.min(Math.max(parseInt(qualityParam, 10), 50), 95) : 82;
+
+          // 1. Fast path: check for pre-generated variant in devMedia
+          const baseKeyWithoutExt = key.replace(/\.[^.]+$/, '');
+          const standardWidths = [240, 360, 480, 720, 1080];
+          const matchedWidth = targetWidth
+            ? (standardWidths.find((sw) => sw >= targetWidth) || 1080)
+            : null;
+
+          if (targetWidth && targetWidth > 0) {
+            const candidateKeys = Array.from(new Set([
+              `${baseKeyWithoutExt}_w${targetWidth}.webp`,
+              ...(matchedWidth ? [`${baseKeyWithoutExt}_w${matchedWidth}.webp`] : []),
+              ...standardWidths
+                .slice()
+                .sort((a, b) => Math.abs(a - targetWidth) - Math.abs(b - targetWidth))
+                .map((w) => `${baseKeyWithoutExt}_w${w}.webp`),
+            ]));
+
+            for (const varKey of candidateKeys) {
+              const variantItem = devMedia.get(varKey);
+              if (variantItem) {
+                const headers = getSafeMediaHeaders('image/webp');
+                for (const [hName, hVal] of Object.entries(headers)) {
+                  res.setHeader(hName, hVal);
+                }
+                res.setHeader('Content-Length', String(variantItem.buffer.length));
+                res.statusCode = 200;
+                return res.end(variantItem.buffer);
+              }
+            }
+          }
+
           const item = devMedia.get(key);
           if (item) {
-            const widthParam = url.searchParams.get('w') || url.searchParams.get('width');
-            const targetWidth = widthParam ? parseInt(widthParam, 10) : null;
-            const qualityParam = url.searchParams.get('q') || url.searchParams.get('quality');
-            const targetQuality = qualityParam ? Math.min(Math.max(parseInt(qualityParam, 10), 50), 95) : 82;
-
             if (targetWidth && targetWidth > 0 && targetWidth <= 2400) {
               try {
                 const sharpModule = await import('sharp');
                 const sharp = (sharpModule as any).default || sharpModule;
                 const accept = (req.headers['accept'] || '') as string;
-                const wantsWebp = accept.includes('image/webp') && item.contentType !== 'image/gif' && item.contentType !== 'image/x-icon';
+                const wantsWebp = accept.includes('image/webp') || item.contentType !== 'image/gif';
 
-                let pipeline = sharp(item.buffer).resize(targetWidth, null, {
+                const effectiveWidth = matchedWidth || targetWidth;
+                let pipeline = sharp(item.buffer).resize(effectiveWidth, null, {
                   withoutEnlargement: true,
                   fit: 'inside',
                 });
 
                 if (wantsWebp) {
                   const webpBuffer = await pipeline.webp({ quality: targetQuality }).toBuffer();
+                  devMedia.set(`${baseKeyWithoutExt}_w${effectiveWidth}.webp`, { buffer: webpBuffer, contentType: 'image/webp' });
                   const headers = getSafeMediaHeaders('image/webp');
                   for (const [hName, hVal] of Object.entries(headers)) {
                     res.setHeader(hName, hVal);

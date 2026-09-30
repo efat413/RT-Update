@@ -524,7 +524,7 @@ export const CartDrawer: React.FC = () => {
                         className="flex gap-3 p-3 bg-slate-50 rounded-2xl border border-slate-200 relative group"
                       >
                         <img
-                          src={getResponsiveImageUrl(item.product.imageUrl, 160)}
+                          src={getResponsiveImageUrl(item.product.imageUrl, 240)}
                           alt={item.product.title}
                           width={64}
                           height={64}

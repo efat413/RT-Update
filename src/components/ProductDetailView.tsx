@@ -543,7 +543,7 @@ export const ProductDetailView: React.FC<ProductDetailViewProps> = ({ productId 
                     title={`View photo ${idx + 1}`}
                   >
                     <img
-                      src={getResponsiveImageUrl(img, 160)}
+                      src={getResponsiveImageUrl(img, 240)}
                       width={64}
                       height={64}
                       alt={`Thumbnail ${idx + 1}`}
@@ -567,7 +567,7 @@ export const ProductDetailView: React.FC<ProductDetailViewProps> = ({ productId 
                       />
                     ) : (
                       <img
-                        src={getResponsiveImageUrl(product.imageUrl, 160)}
+                        src={getResponsiveImageUrl(product.imageUrl, 240)}
                         width={64}
                         height={64}
                         alt="video thumbnail"

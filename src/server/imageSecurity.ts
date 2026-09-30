@@ -226,8 +226,8 @@ export function validateImageBuffer(buffer: ArrayBuffer | Uint8Array): ImageVali
  */
 export function isValidMediaKey(key: string): boolean {
   if (!key || typeof key !== 'string') return false;
-  // Strict regex: must strictly match asset-<timestamp>-<alphanumeric>.<ext>
-  return /^asset-\d+-[a-z0-9]+\.(jpg|png|webp|gif|ico)$/.test(key);
+  // Strict regex: must strictly match asset-<timestamp>-<alphanumeric>(_w<width>)?<ext>
+  return /^asset-\d+-[a-z0-9]+(_w\d+)?\.(jpg|png|webp|gif|ico)$/.test(key);
 }
 
 /**
@@ -243,6 +243,7 @@ export function generateSafeMediaKey(extension: string): string {
 
 /**
  * Returns strict security headers when serving uploaded media.
+ * Ensures Vary: Accept so WebP content negotiation never causes cache collisions across clients.
  */
 export function getSafeMediaHeaders(mime: string): Record<string, string> {
   return {
@@ -250,5 +251,6 @@ export function getSafeMediaHeaders(mime: string): Record<string, string> {
     'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': "default-src 'none'",
     'Cache-Control': 'public, max-age=31536000, immutable',
+    'Vary': 'Accept',
   };
 }

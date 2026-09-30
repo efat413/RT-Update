@@ -142,7 +142,7 @@ export const WishlistDrawer: React.FC = () => {
                       className="w-20 h-20 sm:w-22 sm:h-22 rounded-xl bg-white overflow-hidden shrink-0 border border-slate-200 cursor-pointer shadow-2xs relative"
                     >
                       <img
-                        src={getResponsiveImageUrl(product.imageUrl, 160)}
+                        src={getResponsiveImageUrl(product.imageUrl, 240)}
                         alt={product.title}
                         width={88}
                         height={88}

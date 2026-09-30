@@ -71,7 +71,7 @@ export const BrandLogo: React.FC<BrandLogoProps> = ({
           {LOGO_SRC && !imageError ? (
             <img
               key={LOGO_SRC}
-              src={getResponsiveImageUrl(LOGO_SRC, 120)}
+              src={getResponsiveImageUrl(LOGO_SRC, 240)}
               alt={`${displayTitle} Logo`}
               width={48}
               height={48}

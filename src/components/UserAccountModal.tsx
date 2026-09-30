@@ -834,7 +834,7 @@ export const UserAccountModal: React.FC<UserAccountModalProps> = ({ isOpen, onCl
                                 <div className="flex items-center gap-2.5 min-w-0 flex-1">
                                   <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 overflow-hidden shrink-0">
                                     <img
-                                      src={getResponsiveImageUrl(it.product.imageUrl, 80)}
+                                      src={getResponsiveImageUrl(it.product.imageUrl, 240)}
                                       alt={it.product.title}
                                       width={36}
                                       height={36}

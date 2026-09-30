@@ -460,7 +460,7 @@ export const OrderTrackingDropdown: React.FC<OrderTrackingDropdownProps> = ({ on
                     <div key={idx} className="p-2 flex items-center justify-between text-xs">
                       <div className="flex items-center gap-2 min-w-0 pr-2">
                         <img
-                          src={getResponsiveImageUrl(item.product.imageUrl, 80)}
+                          src={getResponsiveImageUrl(item.product.imageUrl, 240)}
                           alt={item.product.title}
                           width={32}
                           height={32}

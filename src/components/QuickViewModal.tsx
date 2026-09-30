@@ -400,7 +400,7 @@ export const QuickViewModal: React.FC<QuickViewModalProps> = ({ product: propPro
                   title={`View photo ${idx + 1}`}
                 >
                   <img
-                    src={getResponsiveImageUrl(img, 120)}
+                    src={getResponsiveImageUrl(img, 240)}
                     width={48}
                     height={48}
                     alt={`Thumbnail ${idx + 1}`}
@@ -430,7 +430,7 @@ export const QuickViewModal: React.FC<QuickViewModalProps> = ({ product: propPro
                     />
                   ) : (
                     <img
-                      src={getResponsiveImageUrl(product.imageUrl, 120)}
+                      src={getResponsiveImageUrl(product.imageUrl, 240)}
                       width={48}
                       height={48}
                       alt={`${product.title} video thumbnail`}
@@ -1143,7 +1143,7 @@ export const QuickViewModal: React.FC<QuickViewModalProps> = ({ product: propPro
                       title={`Jump to photo ${idx + 1}`}
                     >
                       <img
-                        src={getResponsiveImageUrl(img, 120)}
+                        src={getResponsiveImageUrl(img, 240)}
                         width={56}
                         height={56}
                         alt={`Thumbnail ${idx + 1}`}

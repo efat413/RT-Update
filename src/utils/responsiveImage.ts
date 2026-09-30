@@ -22,51 +22,66 @@ export interface ResponsiveImagePreset {
   aspectRatio: string;
 }
 
+export const STANDARD_AVAILABLE_IMAGE_WIDTHS = [240, 360, 480, 720, 1080] as const;
+export type StandardAvailableImageWidth = typeof STANDARD_AVAILABLE_IMAGE_WIDTHS[number];
+
+/**
+ * Maps any requested target pixel width for internal media to the nearest supported available width.
+ * Prevents requests for arbitrary or missing variants from downloading the full original image.
+ */
+export function getBestAvailableInternalWidth(targetWidth: number): StandardAvailableImageWidth {
+  if (targetWidth <= 240) return 240;
+  if (targetWidth <= 360) return 360;
+  if (targetWidth <= 480) return 480;
+  if (targetWidth <= 720) return 720;
+  return 1080;
+}
+
 export const RESPONSIVE_IMAGE_PRESETS: Record<
   'card' | 'thumbnail' | 'detail' | 'banner' | 'logo',
   ResponsiveImagePreset
 > = {
   // Product cards in 2-col (mobile) to 4-col (desktop) grids
   card: {
-    widths: [240, 360, 480, 600],
+    widths: [240, 360, 480, 720],
     sizes: '(max-width: 640px) 50vw, (max-width: 1024px) 33vw, 280px',
     defaultWidth: 360,
     width: 360,
     height: 360,
     aspectRatio: '1 / 1',
   },
-  // Small cart/wishlist/checkout thumbnails (48px - 80px rendered)
+  // Small cart/wishlist/checkout thumbnails (48px - 88px rendered)
   thumbnail: {
-    widths: [80, 120, 160],
+    widths: [240, 360],
     sizes: '80px',
-    defaultWidth: 120,
+    defaultWidth: 240,
     width: 80,
     height: 80,
     aspectRatio: '1 / 1',
   },
   // Main product detail view in modal / page with high-res zoom
   detail: {
-    widths: [480, 720, 960, 1200],
+    widths: [480, 720, 1080],
     sizes: '(max-width: 768px) 100vw, 50vw',
-    defaultWidth: 800,
+    defaultWidth: 720,
     width: 800,
     height: 800,
     aspectRatio: '1 / 1',
   },
   // Master hero carousel banner (5:2 desktop aspect ratio)
   banner: {
-    widths: [640, 960, 1280, 1600, 1920],
+    widths: [480, 720, 1080],
     sizes: '100vw',
-    defaultWidth: 1280,
+    defaultWidth: 1080,
     width: 1200,
     height: 480,
     aspectRatio: '1200 / 480',
   },
   // Brand logo
   logo: {
-    widths: [96, 160, 240],
+    widths: [240],
     sizes: '48px',
-    defaultWidth: 120,
+    defaultWidth: 240,
     width: 48,
     height: 48,
     aspectRatio: '1 / 1',
@@ -124,20 +139,22 @@ export function getResponsiveImageUrl(url: string, width: number, quality: numbe
   }
 
   // 2. Internal Cloudflare / D1 / R2 media endpoints (/api/media/:key)
-  // Preserves clean media URL unless a dedicated edge transformation service is configured
+  // Maps to genuine available pregenerated/transformed variant widths (240, 360, 480, 720, 1080)
   if (isInternalMediaUrl(cleanUrl)) {
+    const availableWidth = getBestAvailableInternalWidth(width);
     try {
       const isAbsolute = cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://');
       const dummyBase = 'https://rongdhonutrade.com';
       const parsed = new URL(cleanUrl, dummyBase);
 
-      // Return clean pathname to avoid generating fragmented cache keys for identical media assets
-      if (isAbsolute) {
-        return `${parsed.origin}${parsed.pathname}`;
+      parsed.searchParams.set('w', availableWidth.toString());
+      if (quality && quality !== 82) {
+        parsed.searchParams.set('q', quality.toString());
       }
-      return parsed.pathname;
+      return isAbsolute ? parsed.toString() : `${parsed.pathname}?${parsed.searchParams.toString()}`;
     } catch {
-      return cleanUrl.split('?')[0];
+      const separator = cleanUrl.includes('?') ? '&' : '?';
+      return `${cleanUrl}${separator}w=${availableWidth}`;
     }
   }
 
@@ -191,16 +208,19 @@ export function getResponsiveSrcSet(
   if (isFixedFormatUrl(url)) return undefined;
 
   // Real Image Transformation Check:
-  // Only generate srcset if the URL is hosted on a CDN that genuinely provides real dynamic resizing (Unsplash, Cloudinary).
-  // Internal media endpoints (/api/media/:key) and unknown external domains return the original uncompressed image,
-  // so generating multiple query param URLs causes browsers to fetch redundant identical assets and pollutes CDN cache keys.
-  const hasGenuineResizing = isUnsplashUrl(url) || isCloudinaryUrl(url);
+  // Supports CDNs (Unsplash, Cloudinary) and internal media endpoints (/api/media/:key)
+  const isInternal = isInternalMediaUrl(url);
+  const hasGenuineResizing = isInternal || isUnsplashUrl(url) || isCloudinaryUrl(url);
   if (!hasGenuineResizing) {
     return undefined;
   }
 
-  // Filter out duplicates and sort ascending
-  const uniqueWidths = Array.from(new Set(widths)).sort((a, b) => a - b);
+  // Filter out duplicates and sort ascending.
+  // For internal media, candidate widths must strictly map to available standard widths.
+  const targetWidths = isInternal
+    ? widths.map(getBestAvailableInternalWidth)
+    : widths;
+  const uniqueWidths = Array.from(new Set(targetWidths)).sort((a, b) => a - b);
   if (uniqueWidths.length === 0) return undefined;
 
   const entries = uniqueWidths.map((w) => `${getResponsiveImageUrl(url, w, quality)} ${w}w`);

@@ -235,7 +235,7 @@ export const OrderSuccessModal: React.FC<OrderSuccessModalProps> = ({ order: ini
                 <div key={idx} className="py-2 flex items-center justify-between text-xs">
                   <div className="flex items-center gap-2">
                     <img
-                      src={getResponsiveImageUrl(item.product.imageUrl, 120)}
+                      src={getResponsiveImageUrl(item.product.imageUrl, 240)}
                       alt={item.product.title}
                       width={40}
                       height={40}

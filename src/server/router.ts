@@ -2507,6 +2507,28 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
         await saveMediaAssetInD1(env.DB, key, verifiedMime, base64Data, fileBuffer.byteLength);
       }
 
+      // Pre-generate standard responsive variants (240, 360, 480, 720, 1080) if node/sharp is available
+      if (typeof process !== 'undefined' && process.versions?.node) {
+        try {
+          const sharpModule = await import('sharp');
+          const sharp = (sharpModule as any).default || sharpModule;
+          const baseKeyWithoutExt = key.replace(/\.[^.]+$/, '');
+          const standardWidths = [240, 360, 480, 720, 1080];
+          for (const w of standardWidths) {
+            const webpBuf = await sharp(Buffer.from(fileBuffer)).resize(w, null, { withoutEnlargement: true, fit: 'inside' }).webp({ quality: 82 }).toBuffer();
+            const varKey = `${baseKeyWithoutExt}_w${w}.webp`;
+            if (r2Bucket) {
+              await r2Bucket.put(varKey, webpBuf, { httpMetadata: { contentType: 'image/webp' } });
+            } else {
+              const b64 = Buffer.from(webpBuf).toString('base64');
+              await saveMediaAssetInD1(env.DB, varKey, 'image/webp', b64, webpBuf.byteLength);
+            }
+          }
+        } catch (variantErr) {
+          console.warn('Failed to pre-generate variants during upload:', variantErr);
+        }
+      }
+
       // 4. Record successful upload in distributed rate limiters
       await Promise.all([
         recordFailedAttempt(burstKey, 10, 60, env.DB),
@@ -2545,7 +2567,81 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       const qualityParam = urlObj.searchParams.get('q') || urlObj.searchParams.get('quality');
       const targetQuality = qualityParam ? parseInt(qualityParam, 10) : 82;
 
-      // In production Cloudflare Workers with Image Resizing enabled:
+      const r2Bucket = env.R2 || env.BUCKET;
+      const standardWidths = [240, 360, 480, 720, 1080];
+      const matchedWidth = targetWidth
+        ? (standardWidths.find((sw) => sw >= targetWidth) || 1080)
+        : null;
+
+      // 1. Check for pre-generated variant in R2 / D1 first:
+      if (targetWidth && targetWidth > 0 && targetWidth <= 2400) {
+        const baseKeyWithoutExt = key.replace(/\.[^.]+$/, '');
+        // Prioritized candidate variant keys:
+        // a. Exact target width requested
+        // b. Matched standard width (240, 360, 480, 720, 1080)
+        // c. Closest alternative standard variants
+        const candidateKeys = Array.from(new Set([
+          `${baseKeyWithoutExt}_w${targetWidth}.webp`,
+          ...(matchedWidth ? [`${baseKeyWithoutExt}_w${matchedWidth}.webp`] : []),
+          ...standardWidths
+            .slice()
+            .sort((a, b) => Math.abs(a - targetWidth) - Math.abs(b - targetWidth))
+            .map((w) => `${baseKeyWithoutExt}_w${w}.webp`),
+        ]));
+
+        for (const variantKey of candidateKeys) {
+          let variantBuffer: Uint8Array | null = null;
+          if (r2Bucket) {
+            const varObj = await r2Bucket.get(variantKey);
+            if (varObj) {
+              if (typeof (varObj as any).arrayBuffer === 'function') {
+                const ab = await (varObj as any).arrayBuffer();
+                variantBuffer = new Uint8Array(ab);
+              } else if ((varObj as any).body) {
+                const reader = ((varObj as any).body as ReadableStream).getReader();
+                const chunks: Uint8Array[] = [];
+                let total = 0;
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (value) {
+                    chunks.push(value);
+                    total += value.length;
+                  }
+                }
+                variantBuffer = new Uint8Array(total);
+                let offset = 0;
+                for (const chunk of chunks) {
+                  variantBuffer.set(chunk, offset);
+                  offset += chunk.length;
+                }
+              }
+            }
+          }
+          if (!variantBuffer && env.DB) {
+            const varAsset = await getMediaAssetFromD1(env.DB, variantKey);
+            if (varAsset) {
+              const raw = atob(varAsset.dataBase64);
+              variantBuffer = new Uint8Array(raw.length);
+              for (let i = 0; i < raw.length; i++) {
+                variantBuffer[i] = raw.charCodeAt(i);
+              }
+            }
+          }
+          if (variantBuffer && variantBuffer.byteLength > 0) {
+            return new Response(variantBuffer, {
+              status: 200,
+              headers: {
+                ...getSafeMediaHeaders('image/webp'),
+                ...getCorsHeaders(request, env),
+                'Content-Length': String(variantBuffer.byteLength),
+              },
+            });
+          }
+        }
+      }
+
+      // 2. In production Cloudflare Workers with Image Resizing enabled:
       // Check if Cloudflare edge image transformation is available on this request
       const isCloudflareResizeRequest = request.headers.has('cf-image-resizing');
       if (
@@ -2557,14 +2653,16 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
         typeof (globalThis as any).fetch === 'function'
       ) {
         try {
-          const cfRes = await (globalThis as any).fetch(request.url, {
+          const originUrl = new URL(request.url);
+          originUrl.search = '';
+          const cfRes = await (globalThis as any).fetch(originUrl.toString(), {
             headers: {
               ...Object.fromEntries(request.headers.entries()),
               'cf-image-resizing': 'active',
             },
             cf: {
               image: {
-                width: targetWidth,
+                width: matchedWidth || targetWidth,
                 quality: Math.min(Math.max(targetQuality, 50), 95),
                 format: 'auto',
                 fit: 'scale-down',
@@ -2580,7 +2678,6 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       let rawBuffer: Uint8Array | null = null;
       let contentType = 'image/jpeg';
 
-      const r2Bucket = env.R2 || env.BUCKET;
       if (r2Bucket) {
         const obj = await r2Bucket.get(key);
         if (obj) {
@@ -2611,7 +2708,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       }
 
       // Check D1 media_assets table
-      if (!rawBuffer) {
+      if (!rawBuffer && env.DB) {
         const asset = await getMediaAssetFromD1(env.DB, key);
         if (asset) {
           const raw = atob(asset.dataBase64);
@@ -2634,15 +2731,30 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
             const sharpModule = await import('sharp');
             const sharp = (sharpModule as any).default || sharpModule;
             const accept = request.headers.get('accept') || '';
-            const wantsWebp = accept.includes('image/webp') && contentType !== 'image/gif' && contentType !== 'image/x-icon';
+            const wantsWebp = accept.includes('image/webp') || contentType !== 'image/gif';
 
-            let pipeline = sharp(Buffer.from(rawBuffer)).resize(targetWidth, null, {
+            const effectiveWidth = matchedWidth || targetWidth;
+            let pipeline = sharp(Buffer.from(rawBuffer)).resize(effectiveWidth, null, {
               withoutEnlargement: true,
               fit: 'inside',
             });
 
             if (wantsWebp) {
               const webpBuffer = await pipeline.webp({ quality: Math.min(Math.max(targetQuality, 50), 95) }).toBuffer();
+              // Persist newly generated variant into R2 or D1 for instant future hits
+              const baseKeyWithoutExt = key.replace(/\.[^.]+$/, '');
+              const varKey = `${baseKeyWithoutExt}_w${effectiveWidth}.webp`;
+              try {
+                if (r2Bucket) {
+                  await r2Bucket.put(varKey, webpBuffer, { httpMetadata: { contentType: 'image/webp' } });
+                } else if (env.DB) {
+                  const b64 = Buffer.from(webpBuffer).toString('base64');
+                  await saveMediaAssetInD1(env.DB, varKey, 'image/webp', b64, webpBuffer.byteLength);
+                }
+              } catch (persistErr) {
+                console.warn('Failed to persist dynamic variant:', persistErr);
+              }
+
               return new Response(webpBuffer, {
                 status: 200,
                 headers: {
