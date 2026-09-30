@@ -98,27 +98,47 @@ export async function verifyCourierWebhookAuth(
 ): Promise<WebhookAuthResult> {
   const { rawBody, headers } = input;
 
-  // 1. Gather all candidate secrets from server environment & settings
+  // 1. Gather all candidate secrets strictly from dedicated webhook environment variables & settings
+  // CRITICAL SECURITY ENFORCEMENT:
+  // ADMIN_SECRET is strictly dedicated to administrator authentication and session token signing.
+  // It must NEVER be accepted or considered as a candidate webhook secret under any circumstances.
+  const envAdminSecret = (
+    env?.ADMIN_SECRET ||
+    (typeof process !== 'undefined' && process.env?.ADMIN_SECRET ? process.env.ADMIN_SECRET : '') ||
+    ''
+  ).trim();
+
   const candidateSecrets = new Set<string>();
 
   const envWebhookSecret = (env?.COURIER_WEBHOOK_SECRET || process.env.COURIER_WEBHOOK_SECRET || '').trim();
-  if (envWebhookSecret) candidateSecrets.add(envWebhookSecret);
-
-  const envAdminSecret = (env?.ADMIN_SECRET || process.env.ADMIN_SECRET || '').trim();
-  if (envAdminSecret) candidateSecrets.add(envAdminSecret);
+  if (envWebhookSecret && (!envAdminSecret || !timingSafeEqualString(envWebhookSecret, envAdminSecret))) {
+    candidateSecrets.add(envWebhookSecret);
+  }
 
   const envSteadfastSecret = (env?.STEADFAST_SECRET_KEY || process.env.STEADFAST_SECRET_KEY || '').trim();
-  if (envSteadfastSecret) candidateSecrets.add(envSteadfastSecret);
+  if (envSteadfastSecret && (!envAdminSecret || !timingSafeEqualString(envSteadfastSecret, envAdminSecret))) {
+    candidateSecrets.add(envSteadfastSecret);
+  }
 
   const settingsSteadfastSecret = (settings?.steadfastSecretKey || '').trim();
-  if (settingsSteadfastSecret) candidateSecrets.add(settingsSteadfastSecret);
+  if (settingsSteadfastSecret && (!envAdminSecret || !timingSafeEqualString(settingsSteadfastSecret, envAdminSecret))) {
+    candidateSecrets.add(settingsSteadfastSecret);
+  }
 
   if (Array.isArray(settings?.courierWebhooks)) {
     for (const w of settings.courierWebhooks) {
       if (w.secret && typeof w.secret === 'string' && w.secret.trim()) {
-        candidateSecrets.add(w.secret.trim());
+        const secretStr = w.secret.trim();
+        if (!envAdminSecret || !timingSafeEqualString(secretStr, envAdminSecret)) {
+          candidateSecrets.add(secretStr);
+        }
       }
     }
+  }
+
+  // Double-check: Unconditionally purge ADMIN_SECRET if present in candidate set
+  if (envAdminSecret) {
+    candidateSecrets.delete(envAdminSecret);
   }
 
   // If no secrets are configured in environment or settings, reject all webhook requests securely
@@ -250,6 +270,15 @@ export async function verifyCourierWebhookAuth(
   // 5. Verify Shared Secret Headers (X-Webhook-Secret, X-Courier-Secret, Secret-Key, Bearer)
   const incomingSecret = secretHeader || bearerSecret;
   if (incomingSecret) {
+    // Explicit security boundary: ADMIN_SECRET must NEVER be accepted as a webhook secret
+    if (envAdminSecret && timingSafeEqualString(incomingSecret, envAdminSecret)) {
+      return {
+        authenticated: false,
+        status: 401,
+        error: 'Unauthorized: Invalid courier webhook secret.',
+      };
+    }
+
     // If Api-Key is also provided, check Steadfast API Key consistency
     const configuredApiKey = (env?.STEADFAST_API_KEY || process.env.STEADFAST_API_KEY || settings?.steadfastApiKey || '').trim();
     if (apiKeyHeader && configuredApiKey) {

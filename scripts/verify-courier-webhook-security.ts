@@ -6,6 +6,7 @@ import { maskCourierWebhooks } from '../src/server/router';
 import { controlledMergeSettings } from '../src/server/db';
 import { computePasswordSignature } from '../src/server/auth';
 import { INITIAL_SETTINGS } from '../src/data/seedData';
+import { verifyCourierWebhookAuth, computeHmacSha256Hex } from '../src/server/webhookAuth';
 
 async function runCourierSecurityTests() {
   console.log('================================================================');
@@ -235,6 +236,246 @@ async function runCourierSecurityTests() {
   assert(
     userUpdateWithoutCurrentPw.status === 400,
     '4.7 PUT /api/users/:id returns HTTP 400 when attempting self-service password update without current password'
+  );
+
+  // ================================================================
+  // 5. COMPLETE SEPARATION OF ADMIN_SECRET FROM WEBHOOK AUTHENTICATION
+  // ================================================================
+  console.log('\n--- 5. ADMIN_SECRET STRICT ISOLATION FROM WEBHOOK AUTHENTICATION ---');
+
+  // 5.1 Unit Level Isolation: verifyCourierWebhookAuth with isolated mock environment
+  const mockAdminSecret = 'test-isolated-admin-secret-99999-exclusive';
+  const mockCourierSecret = 'test-dedicated-courier-webhook-secret-12345';
+  const mockIsolationEnv = {
+    ADMIN_SECRET: mockAdminSecret,
+    COURIER_WEBHOOK_SECRET: mockCourierSecret,
+  };
+
+  const testPayload = JSON.stringify({ consignment_id: 'TEST-ISO-1', status: 'delivered' });
+  const testIsoTimestamp = Date.now().toString();
+
+  // Test 5.1: ADMIN_SECRET passed as X-Webhook-Secret must be REJECTED (401)
+  const resUnitAdminSecret = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-secret': mockAdminSecret,
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any
+  );
+  assert(
+    resUnitAdminSecret.authenticated === false && resUnitAdminSecret.status === 401,
+    '5.1 verifyCourierWebhookAuth REJECTS ADMIN_SECRET provided via x-webhook-secret header (authenticated: false, 401)'
+  );
+
+  // Test 5.2: HMAC signature computed with ADMIN_SECRET must be REJECTED (401)
+  const adminSignedSig = await computeHmacSha256Hex(mockAdminSecret, `${testIsoTimestamp}.${testPayload}`);
+  const resUnitAdminSig = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-signature': `sha256=${adminSignedSig}`,
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any
+  );
+  assert(
+    resUnitAdminSig.authenticated === false && resUnitAdminSig.status === 401,
+    '5.2 verifyCourierWebhookAuth REJECTS HMAC signature generated with ADMIN_SECRET (authenticated: false, 401)'
+  );
+
+  // Test 5.3: Dedicated COURIER_WEBHOOK_SECRET provided via header must be ACCEPTED (200)
+  const resUnitCourierSecret = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-secret': mockCourierSecret,
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any
+  );
+  assert(
+    resUnitCourierSecret.authenticated === true && resUnitCourierSecret.status === 200,
+    '5.3 verifyCourierWebhookAuth ACCEPTS dedicated COURIER_WEBHOOK_SECRET provided via x-webhook-secret header (200)'
+  );
+
+  // Test 5.4: Dedicated COURIER_WEBHOOK_SECRET HMAC signature must be ACCEPTED (200)
+  const courierSignedSig = await computeHmacSha256Hex(mockCourierSecret, `${testIsoTimestamp}.${testPayload}`);
+  const resUnitCourierSig = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-signature': `sha256=${courierSignedSig}`,
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any
+  );
+  assert(
+    resUnitCourierSig.authenticated === true && resUnitCourierSig.status === 200,
+    '5.4 verifyCourierWebhookAuth ACCEPTS valid HMAC signature generated with COURIER_WEBHOOK_SECRET (200)'
+  );
+
+  // Test 5.5: Invalid arbitrary secret must be REJECTED (401)
+  const resUnitInvalidSecret = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-secret': 'completely-wrong-unconfigured-secret-999',
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any
+  );
+  assert(
+    resUnitInvalidSecret.authenticated === false && resUnitInvalidSecret.status === 401,
+    '5.5 verifyCourierWebhookAuth REJECTS invalid/unconfigured webhook secret (authenticated: false, 401)'
+  );
+
+  // Test 5.6: Accidental settings secret equal to ADMIN_SECRET is purged and REJECTED
+  const resAccidentalSettings = await verifyCourierWebhookAuth(
+    {
+      rawBody: testPayload,
+      headers: {
+        'x-webhook-secret': mockAdminSecret,
+        'x-webhook-timestamp': testIsoTimestamp,
+      },
+    },
+    mockIsolationEnv as any,
+    {
+      courierWebhooks: [{ id: 'accidental', url: 'https://example.com', secret: mockAdminSecret, isActive: true }],
+    }
+  );
+  assert(
+    resAccidentalSettings.authenticated === false && resAccidentalSettings.status === 401,
+    '5.6 Accidental courierWebhooks setting equal to ADMIN_SECRET is purged and strictly REJECTED (401)'
+  );
+
+  // 5.2 Live HTTP Endpoint Tests on /api/webhook/steadfast
+  const serverAdminSecret = process.env.ADMIN_SECRET || 'dev-secret-local-admin';
+  const serverCourierSecret = process.env.COURIER_WEBHOOK_SECRET || 'dev-courier-webhook-secret-999';
+
+  const liveIsoTimestamp = Date.now().toString();
+  const livePayload = JSON.stringify({
+    consignment_id: 'ISO-LIVE-001',
+    invoice: 'ORD-LIVE-001',
+    tracking_code: 'TRK-LIVE-001',
+    status: 'in_review',
+    nonce: `iso-${Date.now()}`,
+  });
+
+  // Test 5.7: Live POST /api/webhook/steadfast with ADMIN_SECRET as X-Webhook-Secret -> 401
+  const liveResAdminSecret = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': serverAdminSecret,
+      'X-Webhook-Timestamp': liveIsoTimestamp,
+    },
+    body: livePayload,
+  });
+  assert(
+    liveResAdminSecret.status === 401,
+    '5.7 Live endpoint /api/webhook/steadfast REJECTS ADMIN_SECRET passed via X-Webhook-Secret (HTTP 401)'
+  );
+
+  // Test 5.8: Live POST /api/webhook/steadfast with ADMIN_SECRET as X-Courier-Secret -> 401
+  const liveResAdminCourierHeader = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Courier-Secret': serverAdminSecret,
+      'X-Webhook-Timestamp': liveIsoTimestamp,
+    },
+    body: livePayload,
+  });
+  assert(
+    liveResAdminCourierHeader.status === 401,
+    '5.8 Live endpoint /api/webhook/steadfast REJECTS ADMIN_SECRET passed via X-Courier-Secret (HTTP 401)'
+  );
+
+  // Test 5.9: Live POST /api/webhook/steadfast with ADMIN_SECRET as Bearer token -> 401
+  const liveResAdminBearer = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${serverAdminSecret}`,
+      'X-Webhook-Timestamp': liveIsoTimestamp,
+    },
+    body: livePayload,
+  });
+  assert(
+    liveResAdminBearer.status === 401,
+    '5.9 Live endpoint /api/webhook/steadfast REJECTS ADMIN_SECRET passed via Authorization Bearer header (HTTP 401)'
+  );
+
+  // Test 5.10: Live POST /api/webhook/steadfast with HMAC signature computed with ADMIN_SECRET -> 401
+  const liveAdminSig = await computeHmacSha256Hex(serverAdminSecret, `${liveIsoTimestamp}.${livePayload}`);
+  const liveResAdminSig = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Signature': `sha256=${liveAdminSig}`,
+      'X-Webhook-Timestamp': liveIsoTimestamp,
+    },
+    body: livePayload,
+  });
+  assert(
+    liveResAdminSig.status === 401,
+    '5.10 Live endpoint /api/webhook/steadfast REJECTS HMAC signature generated with ADMIN_SECRET (HTTP 401)'
+  );
+
+  // Test 5.11: Live POST /api/webhook/steadfast with valid COURIER_WEBHOOK_SECRET -> 200
+  const liveCourierTimestamp = (Date.now() + 100).toString();
+  const liveCourierPayload = JSON.stringify({
+    consignment_id: 'ISO-LIVE-002',
+    invoice: 'ORD-LIVE-002',
+    tracking_code: 'TRK-LIVE-002',
+    status: 'in_review',
+    nonce: `iso-courier-${Date.now()}`,
+  });
+  const liveCourierSig = await computeHmacSha256Hex(serverCourierSecret, `${liveCourierTimestamp}.${liveCourierPayload}`);
+  const liveResCourier = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Signature': `sha256=${liveCourierSig}`,
+      'X-Webhook-Timestamp': liveCourierTimestamp,
+    },
+    body: liveCourierPayload,
+  });
+  assert(
+    liveResCourier.status === 200,
+    '5.11 Live endpoint /api/webhook/steadfast ACCEPTS valid HMAC signature generated with dedicated COURIER_WEBHOOK_SECRET (HTTP 200)'
+  );
+
+  // Test 5.12: Live POST /api/webhook/steadfast with invalid secret -> 401
+  const liveResInvalid = await fetch(`${baseUrl}/api/webhook/steadfast`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': 'invalid-bogus-secret-8888',
+      'X-Webhook-Timestamp': liveCourierTimestamp,
+    },
+    body: liveCourierPayload,
+  });
+  assert(
+    liveResInvalid.status === 401,
+    '5.12 Live endpoint /api/webhook/steadfast REJECTS invalid secret (HTTP 401)'
+  );
+
+  // Test 5.13: Legitimate Admin Authentication is NOT broken and continues to work normally
+  const adminMeRes = await fetch(`${baseUrl}/api/auth/me`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+  const adminMeJson = await adminMeRes.json().catch(() => ({}));
+  assert(
+    adminMeRes.status === 200 && adminMeJson.success === true && adminMeJson.user?.role === 'super_admin',
+    '5.13 Legitimate Admin Authentication (/api/auth/me) continues to function perfectly with verified admin session'
   );
 
   console.log('\n================================================================');
