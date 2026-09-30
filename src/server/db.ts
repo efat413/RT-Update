@@ -2872,20 +2872,49 @@ export async function insertAuditLogInD1(
   };
 }
 
-export async function getAuditLogsFromD1(
+export interface PaginatedAuditLogsResult {
+  logs: AuditLogEntry[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+export async function getPaginatedAuditLogsFromD1(
   db: D1Database,
-  options?: { limit?: number; offset?: number }
-): Promise<AuditLogEntry[]> {
-  const limit = options?.limit || 100;
-  const offset = options?.offset || 0;
+  options?: { page?: number; limit?: number; offset?: number }
+): Promise<PaginatedAuditLogsResult> {
+  const DEFAULT_LIMIT = 50;
+  const MAX_LIMIT = 200;
+
+  const rawLimit = Number(options?.limit);
+  const limit = !isNaN(rawLimit) && rawLimit > 0
+    ? Math.min(MAX_LIMIT, Math.max(1, Math.floor(rawLimit)))
+    : DEFAULT_LIMIT;
+
+  let page = 1;
+  let offset = 0;
+
+  if (options?.page !== undefined) {
+    page = Math.max(1, Math.floor(Number(options.page)) || 1);
+    offset = (page - 1) * limit;
+  } else if (options?.offset !== undefined) {
+    offset = Math.max(0, Math.floor(Number(options.offset)) || 0);
+    page = Math.floor(offset / limit) + 1;
+  }
 
   try {
+    const countRow = await db
+      .prepare('SELECT COUNT(*) as total FROM audit_logs')
+      .first<{ total: number }>();
+    const total = Number(countRow?.total) || 0;
+
     const { results } = await db
       .prepare(`SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT ? OFFSET ?`)
       .bind(limit, offset)
       .all<any>();
 
-    return (results || []).map((row) => {
+    const logs = (results || []).map((row) => {
       let details = undefined;
       if (row.details_json) {
         try {
@@ -2905,9 +2934,34 @@ export async function getAuditLogsFromD1(
         ipAddress: row.ip_address || undefined,
       };
     });
-  } catch {
-    return [];
+
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    return {
+      logs,
+      total,
+      page,
+      limit,
+      totalPages,
+    };
+  } catch (err) {
+    console.error('Error querying audit logs from D1:', err);
+    return {
+      logs: [],
+      total: 0,
+      page,
+      limit,
+      totalPages: 1,
+    };
   }
+}
+
+export async function getAuditLogsFromD1(
+  db: D1Database,
+  options?: { limit?: number; offset?: number; page?: number }
+): Promise<AuditLogEntry[]> {
+  const result = await getPaginatedAuditLogsFromD1(db, options);
+  return result.logs;
 }
 
 /**

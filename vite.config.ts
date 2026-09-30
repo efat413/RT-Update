@@ -56,7 +56,38 @@ function localApiDevPlugin(): Plugin {
   let devCategories: any[] = [...INITIAL_CATEGORIES];
   let devSliders: any[] = [...INITIAL_SLIDES];
   let devSettings: any = { ...INITIAL_SETTINGS };
-  let devAuditLogs: any[] = [];
+  const generateInitialDevAuditLogs = (): any[] => {
+    const actions = [
+      { action: 'SETTINGS_UPDATE', targetType: 'settings', details: 'Store brand settings updated' },
+      { action: 'ORDER_COURIER_DISPATCH', targetType: 'order', details: 'Order dispatched via Steadfast' },
+      { action: 'ORDER_COURIER_WEBHOOK_UPDATE', targetType: 'order', details: 'Order status updated via courier webhook' },
+      { action: 'USER_PERMISSION_UPDATE', targetType: 'user', details: 'Role permissions modified' },
+      { action: 'PRODUCT_PRICE_UPDATE', targetType: 'product', details: 'Product pricing updated' },
+      { action: 'EXPENSE_RECORDED', targetType: 'expense', details: 'Operating expense recorded' },
+    ];
+    const roles = ['super_admin', 'admin', 'sub_admin', 'webhook'];
+    const logs: any[] = [];
+    const now = Date.now();
+    for (let i = 0; i < 120; i++) {
+      const act = actions[i % actions.length];
+      const role = roles[i % roles.length];
+      logs.push({
+        id: `audit-seed-${1000 + i}`,
+        timestamp: new Date(now - i * 15 * 60 * 1000).toISOString(),
+        actorId: role === 'webhook' ? 'webhook:steadfast' : `dev-${role}-1`,
+        actorEmail: role === 'webhook' ? 'webhook@steadfast.com.bd' : `${role}@local.test`,
+        actorRole: role,
+        action: act.action,
+        targetId: `target-${100 + i}`,
+        targetType: act.targetType,
+        details: act.details,
+        ipAddress: '127.0.0.1',
+      });
+    }
+    return logs;
+  };
+
+  let devAuditLogs: any[] = generateInitialDevAuditLogs();
 
   // Load persistent dev settings from disk if available
   try {
@@ -1565,8 +1596,54 @@ function localApiDevPlugin(): Plugin {
           const permErr = requireDevPermission(authResult, 'audit_log.view');
           if (permErr) return sendDevError(res, permErr);
 
+          const pageParam = url.searchParams.get('page');
+          const limitParam = url.searchParams.get('limit');
+          const offsetParam = url.searchParams.get('offset');
+
+          const DEFAULT_LIMIT = 50;
+          const MAX_LIMIT = 200;
+
+          let limit = DEFAULT_LIMIT;
+          if (limitParam !== null) {
+            const parsed = parseInt(limitParam, 10);
+            if (!isNaN(parsed)) {
+              limit = Math.min(MAX_LIMIT, Math.max(1, parsed));
+            }
+          }
+
+          let page = 1;
+          let offset = 0;
+          if (pageParam !== null) {
+            const parsedPage = parseInt(pageParam, 10);
+            if (!isNaN(parsedPage) && parsedPage >= 1) {
+              page = parsedPage;
+              offset = (page - 1) * limit;
+            }
+          } else if (offsetParam !== null) {
+            const parsedOffset = parseInt(offsetParam, 10);
+            if (!isNaN(parsedOffset) && parsedOffset >= 0) {
+              offset = parsedOffset;
+              page = Math.floor(offset / limit) + 1;
+            }
+          }
+
+          // Ensure devAuditLogs are sorted newest first
+          const sorted = [...devAuditLogs].sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+          const total = sorted.length;
+          const totalPages = Math.ceil(total / limit) || 1;
+          const pagedLogs = sorted.slice(offset, offset + limit);
+
+          res.setHeader('Content-Type', 'application/json');
           res.statusCode = 200;
-          return res.end(JSON.stringify({ success: true, count: devAuditLogs.length, logs: devAuditLogs }));
+          return res.end(JSON.stringify({
+            success: true,
+            count: pagedLogs.length,
+            total,
+            page,
+            limit,
+            totalPages,
+            logs: pagedLogs,
+          }));
         }
 
         // 0. OPTIMIZED PUBLIC HOMEPAGE CONSOLIDATED ROUTE

@@ -70,6 +70,7 @@ import {
   // Audit Logs
   insertAuditLogInD1,
   getAuditLogsFromD1,
+  getPaginatedAuditLogsFromD1,
   findOrderByCourierIdentifier,
   checkAndRecordWebhookFingerprint,
 } from './db';
@@ -1837,10 +1838,52 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
     const permErr = requirePermission(auth!, 'audit_log.view');
     if (permErr) return permErr;
 
+    const pageParam = url.searchParams.get('page');
     const limitParam = url.searchParams.get('limit');
-    const limit = limitParam ? parseInt(limitParam, 10) : 100;
-    const logs = await getAuditLogsFromD1(env.DB, { limit });
-    return jsonResponse({ success: true, count: logs.length, logs });
+    const offsetParam = url.searchParams.get('offset');
+
+    const DEFAULT_LIMIT = 50;
+    const MAX_LIMIT = 200;
+
+    let parsedLimit = DEFAULT_LIMIT;
+    if (limitParam !== null) {
+      const parsed = parseInt(limitParam, 10);
+      if (!isNaN(parsed)) {
+        parsedLimit = Math.min(MAX_LIMIT, Math.max(1, parsed));
+      }
+    }
+
+    let page = 1;
+    let offset = 0;
+    if (pageParam !== null) {
+      const parsedPage = parseInt(pageParam, 10);
+      if (!isNaN(parsedPage) && parsedPage >= 1) {
+        page = parsedPage;
+        offset = (page - 1) * parsedLimit;
+      }
+    } else if (offsetParam !== null) {
+      const parsedOffset = parseInt(offsetParam, 10);
+      if (!isNaN(parsedOffset) && parsedOffset >= 0) {
+        offset = parsedOffset;
+        page = Math.floor(offset / parsedLimit) + 1;
+      }
+    }
+
+    const paginated = await getPaginatedAuditLogsFromD1(env.DB, {
+      page,
+      limit: parsedLimit,
+      offset,
+    });
+
+    return jsonResponse({
+      success: true,
+      count: paginated.logs.length,
+      total: paginated.total,
+      page: paginated.page,
+      limit: paginated.limit,
+      totalPages: paginated.totalPages,
+      logs: paginated.logs,
+    });
   }
 
   // ==========================================
