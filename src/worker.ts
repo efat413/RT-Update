@@ -374,9 +374,8 @@ export default {
   async scheduled(event: any, env: Env, ctx?: any): Promise<void> {
     if (!env.DB) return;
     try {
-      const settings = await getStoreSettings(env.DB);
-      const apiKey = env.STEADFAST_API_KEY || settings.steadfastApiKey;
-      const secretKey = env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey;
+      const apiKey = (env.STEADFAST_API_KEY || '').trim();
+      const secretKey = (env.STEADFAST_SECRET_KEY || '').trim();
       if (apiKey && secretKey) {
         const result = await syncAllActiveCourierOrders(env.DB, { apiKey, secretKey });
         console.log(`[Courier Cron Sync] Checked ${result.totalChecked} orders, updated ${result.updatedCount}.`);

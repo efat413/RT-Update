@@ -1145,7 +1145,95 @@ export function controlledMergeSettings(current: StoreSettings, updates: Partial
     }
   }
 
+  // Security constraint: Production courier API credentials must never be persisted into D1 store_settings
+  delete (merged as any).steadfastApiKey;
+  delete (merged as any).steadfastSecretKey;
+
   return merged;
+}
+
+export interface LegacyCourierCredentialsReport {
+  hasLegacyCredentials: boolean;
+  hasLegacyApiKey: boolean;
+  hasLegacySecretKey: boolean;
+  legacyApiKeyMasked?: string;
+  legacySecretKeyMasked?: string;
+}
+
+/**
+ * Detects whether legacy plaintext courier credentials exist in D1 store_settings table.
+ * Does NOT return plaintext secrets. Used to advise administrators on migration to Worker Secrets.
+ */
+export async function detectLegacyD1CourierCredentials(db: D1Database): Promise<LegacyCourierCredentialsReport> {
+  try {
+    const row = await db
+      .prepare('SELECT settings_json FROM store_settings WHERE id = "default" LIMIT 1')
+      .first<StoreSettingsRow>();
+    if (!row || !row.settings_json) {
+      return { hasLegacyCredentials: false, hasLegacyApiKey: false, hasLegacySecretKey: false };
+    }
+    const parsed = JSON.parse(row.settings_json);
+    const hasKey = typeof parsed.steadfastApiKey === 'string' && parsed.steadfastApiKey.trim().length > 0 && !parsed.steadfastApiKey.startsWith('••');
+    const hasSecret = typeof parsed.steadfastSecretKey === 'string' && parsed.steadfastSecretKey.trim().length > 0 && !parsed.steadfastSecretKey.startsWith('••');
+    return {
+      hasLegacyCredentials: hasKey || hasSecret,
+      hasLegacyApiKey: hasKey,
+      hasLegacySecretKey: hasSecret,
+      legacyApiKeyMasked: hasKey ? '••••••••' : undefined,
+      legacySecretKeyMasked: hasSecret ? '••••••••' : undefined,
+    };
+  } catch (err) {
+    console.error('Failed to inspect legacy credentials in D1:', err);
+    return { hasLegacyCredentials: false, hasLegacyApiKey: false, hasLegacySecretKey: false };
+  }
+}
+
+/**
+ * Safely removes legacy courier credentials (steadfastApiKey, steadfastSecretKey) from D1 store_settings.
+ * Should be called after Worker Secrets (STEADFAST_API_KEY, STEADFAST_SECRET_KEY) are configured.
+ */
+export async function cleanupLegacyCourierCredentialsFromD1(db: D1Database): Promise<{
+  success: boolean;
+  cleaned: boolean;
+  message: string;
+}> {
+  const row = await db
+    .prepare('SELECT settings_json FROM store_settings WHERE id = "default" LIMIT 1')
+    .first<StoreSettingsRow>();
+  if (!row || !row.settings_json) {
+    return { success: true, cleaned: false, message: 'No store settings record found in D1.' };
+  }
+  try {
+    const parsed = JSON.parse(row.settings_json);
+    let changed = false;
+    if ('steadfastApiKey' in parsed) {
+      delete parsed.steadfastApiKey;
+      changed = true;
+    }
+    if ('steadfastSecretKey' in parsed) {
+      delete parsed.steadfastSecretKey;
+      changed = true;
+    }
+    if (changed) {
+      await db
+        .prepare('UPDATE store_settings SET settings_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = "default"')
+        .bind(JSON.stringify(parsed))
+        .run();
+      return {
+        success: true,
+        cleaned: true,
+        message: 'Legacy courier credentials were safely removed from D1 settings.',
+      };
+    }
+    return {
+      success: true,
+      cleaned: false,
+      message: 'D1 store settings are already clean of legacy credentials.',
+    };
+  } catch (err: any) {
+    console.error('Failed to cleanup legacy courier credentials in D1:', err);
+    throw new Error('Failed to clean legacy courier credentials from D1.');
+  }
 }
 
 export async function getStoreSettings(db: D1Database): Promise<StoreSettings> {
@@ -1209,11 +1297,18 @@ export async function getStoreSettings(db: D1Database): Promise<StoreSettings> {
 }
 
 export async function updateStoreSettingsInD1(db: D1Database, updates: Partial<StoreSettings>): Promise<StoreSettings> {
+  // Never persist courier credentials into D1 settings_json
+  const safeUpdates = { ...updates };
+  delete (safeUpdates as any).steadfastApiKey;
+  delete (safeUpdates as any).steadfastSecretKey;
+
   // 1. Read existing canonical settings from D1
   const current = await getStoreSettings(db);
 
   // 2. Controlled deep merge
-  const merged = controlledMergeSettings(current, updates);
+  const merged = controlledMergeSettings(current, safeUpdates);
+  delete (merged as any).steadfastApiKey;
+  delete (merged as any).steadfastSecretKey;
   const settingsJson = JSON.stringify(merged);
 
   // 3. Persist to Cloudflare D1

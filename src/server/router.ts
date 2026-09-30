@@ -24,6 +24,8 @@ import {
   // Store Settings
   getStoreSettings,
   updateStoreSettingsInD1,
+  detectLegacyD1CourierCredentials,
+  cleanupLegacyCourierCredentialsFromD1,
   // Media Assets
   saveMediaAssetInD1,
   getMediaAssetFromD1,
@@ -272,14 +274,19 @@ function jsonResponse(data: any, status = 200, customHeaders: Record<string, str
 
     // 2. Hide internal server errors (5xx): Never expose raw err.message or database internals to clients
     if (status >= 500) {
-      if (payload.error && payload.error !== 'Internal server error.') {
+      const isSafe503Message =
+        status === 503 &&
+        typeof payload.error === 'string' &&
+        payload.error.toLowerCase().includes('unavailable');
+
+      if (!isSafe503Message && payload.error && payload.error !== 'Internal server error.') {
         console.error('[Server Internal Error Logged Safely]:', payload.error);
         payload = {
           ...payload,
           error: 'Internal server error.',
         };
       }
-      if (payload.message && typeof payload.message === 'string' && !payload.success) {
+      if (!isSafe503Message && payload.message && typeof payload.message === 'string' && !payload.success) {
         console.error('[Server Internal Message Logged Safely]:', payload.message);
         payload = {
           ...payload,
@@ -774,7 +781,8 @@ export function maskCourierWebhooks(webhooks: any[]): any[] {
 function maskSettings(
   settings: StoreSettings,
   isAuthenticatedAdmin: boolean,
-  canViewCourierCredentials: boolean = false
+  canViewCourierCredentials: boolean = false,
+  env?: any
 ): StoreSettings {
   if (!isAuthenticatedAdmin) {
     // Return only safe customer-facing public properties
@@ -815,8 +823,12 @@ function maskSettings(
     ...settings,
   };
   if (canViewCourierCredentials) {
-    safeAdminSettings.steadfastApiKey = settings.steadfastApiKey ? '••••••••' : '';
-    safeAdminSettings.steadfastSecretKey = settings.steadfastSecretKey ? '••••••••' : '';
+    const hasSteadfastConfigured = Boolean(
+      (env && env.STEADFAST_API_KEY && env.STEADFAST_API_KEY.trim().length > 0) ||
+      (typeof settings.steadfastApiKey === 'string' && settings.steadfastApiKey.trim().length > 0)
+    );
+    safeAdminSettings.steadfastApiKey = hasSteadfastConfigured ? '••••••••' : '';
+    safeAdminSettings.steadfastSecretKey = hasSteadfastConfigured ? '••••••••' : '';
     if (Array.isArray(settings.courierWebhooks)) {
       safeAdminSettings.courierWebhooks = maskCourierWebhooks(settings.courierWebhooks);
     }
@@ -2404,7 +2416,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
   // ==========================================
   // 4. STORE SETTINGS ROUTES
   // ==========================================
-  if (path === '/api/settings') {
+  if (path === '/api/settings' || path === '/api/admin/settings') {
     if (method === 'GET') {
       try {
         const rawSettings = await getStoreSettings(env.DB);
@@ -2419,7 +2431,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
 
         return jsonResponse({
           success: true,
-          settings: maskSettings(rawSettings, isAdmin, canViewCourier),
+          settings: maskSettings(rawSettings, isAdmin, canViewCourier, env),
         }, 200, {
           'Cache-Control': cacheControl,
           'Vary': 'Origin, Cookie, Authorization',
@@ -2444,14 +2456,9 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
           return jsonResponse({ success: false, error: 'Invalid settings payload: expected a settings object.' }, 400);
         }
 
-        // Protect existing courier secrets if masked asterisks are received
-        const existingSettings = await getStoreSettings(env.DB);
-        if (updates.steadfastApiKey === '••••••••' || updates.steadfastApiKey?.startsWith('****')) {
-          updates.steadfastApiKey = existingSettings.steadfastApiKey;
-        }
-        if (updates.steadfastSecretKey === '••••••••' || updates.steadfastSecretKey?.startsWith('****')) {
-          updates.steadfastSecretKey = existingSettings.steadfastSecretKey;
-        }
+        // Courier credentials must NEVER be persisted into D1 store settings
+        delete updates.steadfastApiKey;
+        delete updates.steadfastSecretKey;
 
         // Save to Cloudflare D1
         const canonical = await updateStoreSettingsInD1(env.DB, updates);
@@ -2465,7 +2472,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
         return jsonResponse({
           success: true,
           message: 'Website settings saved and verified in Cloudflare D1 central database!',
-          settings: maskSettings(canonical, true, canViewCourier),
+          settings: maskSettings(canonical, true, canViewCourier, env),
         });
       } catch (err: any) {
         console.error('Failed to update store settings in D1:', err);
@@ -4023,6 +4030,77 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
   // ==========================================
   // 9. COURIER PROXY ROUTES (Secure Server-Side Steadfast Integration)
   // ==========================================
+
+  // Check courier credentials migration status (Worker secrets vs D1 legacy storage)
+  if (path === '/api/admin/courier/credentials/status' && method === 'GET') {
+    const { auth, errorResponse } = await requireAuth(request, env);
+    if (errorResponse) return errorResponse;
+    const canCheck = auth!.role === 'super_admin' || hasPermission(auth!, 'courier.configure') || hasPermission(auth!, 'settings.manage');
+    if (!canCheck) {
+      return jsonResponse({ success: false, error: 'Forbidden: Courier configuration permission required.' }, 403);
+    }
+
+    const legacyReport = await detectLegacyD1CourierCredentials(env.DB);
+    const hasWorkerApiKey = Boolean(env.STEADFAST_API_KEY && env.STEADFAST_API_KEY.trim().length > 0);
+    const hasWorkerSecretKey = Boolean(env.STEADFAST_SECRET_KEY && env.STEADFAST_SECRET_KEY.trim().length > 0);
+    const hasWorkerWebhookSecret = Boolean(env.COURIER_WEBHOOK_SECRET && env.COURIER_WEBHOOK_SECRET.trim().length > 0);
+
+    return jsonResponse({
+      success: true,
+      workerSecretsConfigured: {
+        apiKey: hasWorkerApiKey,
+        secretKey: hasWorkerSecretKey,
+        webhookSecret: hasWorkerWebhookSecret,
+      },
+      legacyD1Credentials: {
+        detected: legacyReport.hasLegacyCredentials,
+        hasApiKey: legacyReport.hasLegacyApiKey,
+        hasSecretKey: legacyReport.hasLegacySecretKey,
+      },
+      migrationSafe: hasWorkerApiKey && hasWorkerSecretKey,
+      instructions: 'Configure Cloudflare Worker Secrets: npx wrangler secret put STEADFAST_API_KEY and npx wrangler secret put STEADFAST_SECRET_KEY. Then trigger cleanup via POST /api/admin/courier/cleanup-legacy-credentials.',
+    });
+  }
+
+  // Safely cleanup legacy courier credentials from D1 after migration
+  if (path === '/api/admin/courier/cleanup-legacy-credentials' && method === 'POST') {
+    const { auth, errorResponse } = await requireAuth(request, env);
+    if (errorResponse) return errorResponse;
+    const canManage = auth!.role === 'super_admin' || hasPermission(auth!, 'settings.manage');
+    if (!canManage) {
+      return jsonResponse({ success: false, error: 'Forbidden: Settings manage permission required.' }, 403);
+    }
+
+    const body = (await request.json().catch(() => ({}))) as any;
+    const hasWorkerApiKey = Boolean(env.STEADFAST_API_KEY && env.STEADFAST_API_KEY.trim().length > 0);
+
+    if (!hasWorkerApiKey && !body?.force) {
+      return jsonResponse({
+        success: false,
+        error: 'Cannot cleanup legacy D1 credentials before Cloudflare Worker Secret STEADFAST_API_KEY is configured. Pass { "force": true } if you intend to remove them without worker secrets.',
+      }, 400);
+    }
+
+    const cleanupResult = await cleanupLegacyCourierCredentialsFromD1(env.DB);
+
+    await insertAuditLogInD1(env.DB, {
+      actorId: auth!.dbUser?.id || auth!.tokenUser?.userId || 'admin',
+      actorEmail: auth!.dbUser?.email || auth!.tokenUser?.email || 'admin@local',
+      actorRole: auth!.role,
+      action: 'COURIER_CREDENTIALS_MIGRATION_CLEANUP',
+      targetId: 'store_settings:default',
+      targetType: 'settings',
+      details: 'Legacy plaintext courier credentials safely removed from D1 store_settings table.',
+      ipAddress: getClientIp(request),
+    }).catch((err) => console.warn('Audit log write error:', err));
+
+    return jsonResponse({
+      success: true,
+      cleaned: cleanupResult.cleaned,
+      message: cleanupResult.message,
+    });
+  }
+
   if (path === '/api/courier/steadfast/test' && method === 'POST') {
     const { auth, errorResponse } = await requireAuth(request, env);
     if (errorResponse) return errorResponse;
@@ -4031,15 +4109,14 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
 
     try {
       const body = (await request.json().catch(() => ({}))) as any;
-      const settings = await getStoreSettings(env.DB);
-      const apiKey = (body?.apiKey || env.STEADFAST_API_KEY || settings.steadfastApiKey || '').trim();
-      const secretKey = (body?.secretKey || env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey || '').trim();
+      const apiKey = (body?.apiKey || env.STEADFAST_API_KEY || '').trim();
+      const secretKey = (body?.secretKey || env.STEADFAST_SECRET_KEY || '').trim();
       const baseUrl = body?.baseUrl;
 
       if (!apiKey || !secretKey) {
         return jsonResponse({
           success: false,
-          error: 'Steadfast Courier API credentials are not configured on the server. Please enter API Key and Secret Key.',
+          error: 'Steadfast Courier API credentials are not configured in Worker secrets or provided in request.',
         }, 400);
       }
 
@@ -4136,13 +4213,14 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       const recipientPhone = (parcelData.recipient_phone || order.customer.phone || '').replace(/[^0-9]/g, '');
 
       if (isSteadfast) {
-        const apiKey = courierParam.apiKey || body.apiKey || env.STEADFAST_API_KEY || settings.steadfastApiKey;
-        const secretKey = courierParam.secretKey || body.secretKey || env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey;
+        // Production Steadfast credentials must come exclusively from Cloudflare Worker secrets
+        const apiKey = (env.STEADFAST_API_KEY || '').trim();
+        const secretKey = (env.STEADFAST_SECRET_KEY || '').trim();
 
         if (!apiKey || !secretKey) {
           return jsonResponse({
             success: false,
-            error: 'Steadfast Courier API credentials are not configured on server.',
+            error: 'Steadfast Courier API credentials are not configured in Worker secrets.',
           }, 400);
         }
 
@@ -4325,7 +4403,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
     }
   }
 
-  const courierStatusMatch = path.match(/^\/api\/courier\/status\/([^/]+)$/);
+  const courierStatusMatch = path.match(/^\/api\/courier\/(?:steadfast\/)?status\/([^/]+)$/);
   if (courierStatusMatch && method === 'GET') {
     const cid = decodeURIComponent(courierStatusMatch[1]).trim();
     const { auth, errorResponse } = await requireAuth(request, env);
@@ -4403,14 +4481,13 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       await clearFailedAttempts(`track_fail:${clientIp}`, env.DB);
     }
 
-    const settings = await getStoreSettings(env.DB);
-    const apiKey = env.STEADFAST_API_KEY || settings.steadfastApiKey;
-    const secretKey = env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey;
+    const apiKey = (env.STEADFAST_API_KEY || '').trim();
+    const secretKey = (env.STEADFAST_SECRET_KEY || '').trim();
 
     if (!apiKey || !secretKey) {
       return jsonResponse({
         success: false,
-        error: 'Courier service temporarily unavailable.',
+        error: 'Courier service temporarily unavailable (Worker secrets unconfigured).',
       }, 503);
     }
 
@@ -4446,12 +4523,11 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
       return jsonResponse({ success: false, error: 'Forbidden: Courier status sync permission required.', requiredPermission: 'courier.status_sync' }, 403);
     }
 
-    const settings = await getStoreSettings(env.DB);
-    const apiKey = env.STEADFAST_API_KEY || settings.steadfastApiKey;
-    const secretKey = env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey;
+    const apiKey = (env.STEADFAST_API_KEY || '').trim();
+    const secretKey = (env.STEADFAST_SECRET_KEY || '').trim();
 
     if (!apiKey || !secretKey) {
-      return jsonResponse({ success: false, error: 'Steadfast Courier API credentials are not configured on server.' }, 400);
+      return jsonResponse({ success: false, error: 'Steadfast Courier API credentials are not configured in Worker secrets.' }, 400);
     }
 
     try {
@@ -4477,12 +4553,11 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
     }
 
     const ordId = decodeURIComponent(syncSingleMatch[1]);
-    const settings = await getStoreSettings(env.DB);
-    const apiKey = env.STEADFAST_API_KEY || settings.steadfastApiKey;
-    const secretKey = env.STEADFAST_SECRET_KEY || settings.steadfastSecretKey;
+    const apiKey = (env.STEADFAST_API_KEY || '').trim();
+    const secretKey = (env.STEADFAST_SECRET_KEY || '').trim();
 
     if (!apiKey || !secretKey) {
-      return jsonResponse({ success: false, error: 'Steadfast Courier API credentials are not configured on server.' }, 400);
+      return jsonResponse({ success: false, error: 'Steadfast Courier API credentials are not configured in Worker secrets.' }, 400);
     }
 
     try {
@@ -4871,7 +4946,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
         'X-Webhook-Timestamp': new Date().toISOString(),
       };
       const serializedTestPayload = JSON.stringify(testPayload);
-      const effectiveTestSecret = secret || (env?.COURIER_WEBHOOK_SECRET || env?.STEADFAST_SECRET_KEY || settings.steadfastSecretKey || '').trim();
+      const effectiveTestSecret = secret || (env?.COURIER_WEBHOOK_SECRET || env?.STEADFAST_SECRET_KEY || '').trim();
       if (effectiveTestSecret) {
         headers['X-Webhook-Secret'] = effectiveTestSecret;
         const sig = await computeHmacSha256Hex(effectiveTestSecret, serializedTestPayload);
@@ -5005,7 +5080,7 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
             'X-Webhook-Timestamp': new Date().toISOString(),
           };
           const serializedPayload = JSON.stringify(payload);
-          const effectiveTriggerSecret = t.secret || (env?.COURIER_WEBHOOK_SECRET || env?.STEADFAST_SECRET_KEY || settings.steadfastSecretKey || '').trim();
+          const effectiveTriggerSecret = t.secret || (env?.COURIER_WEBHOOK_SECRET || env?.STEADFAST_SECRET_KEY || '').trim();
           if (effectiveTriggerSecret) {
             headers['X-Webhook-Secret'] = effectiveTriggerSecret;
             const sig = await computeHmacSha256Hex(effectiveTriggerSecret, serializedPayload);

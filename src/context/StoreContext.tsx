@@ -43,6 +43,13 @@ import {
   INITIAL_REVIEWS,
   INITIAL_COUPONS,
 } from '../data/seedData';
+import {
+  sanitizeCourierConfig,
+  sanitizeCourierConfigs,
+  sanitizeSettingsForBrowserStorage,
+  sanitizeWebhooksForBrowserStorage,
+  sanitizeAllBrowserStorage,
+} from '../utils/courierStorage';
 import { orderApi, OrderQueryParams, OrderSummaryStats } from '../services/orderApi';
 import {
   productsApi,
@@ -604,13 +611,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   // 6. Slides State - Cloudflare D1 is the sole source of truth (empty initial state prevents seed flash)
   const [slides, setSlides] = useState<CarouselSlide[]>([]);
 
-  // 7. Courier APIs Config State
+  // 7. Courier APIs Config State (Strictly sanitized: zero credentials stored in state or localStorage)
   const [courierConfigs, setCourierConfigs] = useState<CourierApiConfig[]>(() => {
     try {
+      sanitizeAllBrowserStorage();
       const saved = localStorage.getItem(STORAGE_KEYS.COURIERS);
-      return saved ? JSON.parse(saved) : INITIAL_COURIER_CONFIGS;
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        const sanitized = sanitizeCourierConfigs(Array.isArray(parsed) ? parsed : INITIAL_COURIER_CONFIGS);
+        localStorage.setItem(STORAGE_KEYS.COURIERS, JSON.stringify(sanitized));
+        return sanitized;
+      }
+      const initialSanitized = sanitizeCourierConfigs(INITIAL_COURIER_CONFIGS);
+      localStorage.setItem(STORAGE_KEYS.COURIERS, JSON.stringify(initialSanitized));
+      return initialSanitized;
     } catch {
-      return INITIAL_COURIER_CONFIGS;
+      return sanitizeCourierConfigs(INITIAL_COURIER_CONFIGS);
     }
   });
 
@@ -1282,7 +1298,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           if (hpData.settings) {
             setSettings(hpData.settings);
             try {
-              const json = JSON.stringify(hpData.settings);
+              const json = JSON.stringify(sanitizeSettingsForBrowserStorage(hpData.settings));
               localStorage.setItem(STORAGE_KEYS.SETTINGS, json);
               localStorage.setItem('rongdhonu_settings', json);
             } catch {}
@@ -1315,7 +1331,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           if (sttngsRes.status === 'fulfilled' && sttngsRes.value) {
             setSettings(sttngsRes.value);
             try {
-              const json = JSON.stringify(sttngsRes.value);
+              const json = JSON.stringify(sanitizeSettingsForBrowserStorage(sttngsRes.value));
               localStorage.setItem(STORAGE_KEYS.SETTINGS, json);
               localStorage.setItem('rongdhonu_settings', json);
             } catch {}
@@ -1725,7 +1741,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEYS.COURIERS, JSON.stringify(courierConfigs));
+      const sanitized = sanitizeCourierConfigs(courierConfigs);
+      localStorage.setItem(STORAGE_KEYS.COURIERS, JSON.stringify(sanitized));
     } catch (e) {
       console.error('Error saving courier configs', e);
     }
@@ -1739,7 +1756,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEYS.COURIER_WEBHOOKS, JSON.stringify(courierWebhooks));
+      const sanitized = sanitizeWebhooksForBrowserStorage(courierWebhooks);
+      localStorage.setItem(STORAGE_KEYS.COURIER_WEBHOOKS, JSON.stringify(sanitized));
     } catch (e) {
       console.error('Error saving courier webhooks', e);
     }
@@ -3238,27 +3256,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  // Admin Courier APIs Management
+  // Admin Courier APIs Management (Strictly enforces credential-free client storage)
   const addCourierConfig = (configData: Omit<CourierApiConfig, 'id'>): CourierApiConfig => {
     let sanitizedBaseUrl = configData.baseUrl?.trim() || '';
     if (sanitizedBaseUrl.includes('portal.steadfast.com.bd')) {
       sanitizedBaseUrl = sanitizedBaseUrl.replace('portal.steadfast.com.bd', 'portal.packzy.com');
     }
 
+    const sanitizedData = sanitizeCourierConfig(configData);
     const newConfig: CourierApiConfig = {
-      ...configData,
-      baseUrl: sanitizedBaseUrl || configData.baseUrl,
+      ...sanitizedData,
+      baseUrl: sanitizedBaseUrl || sanitizedData.baseUrl,
       id: `courier-${Date.now()}`,
     };
     setCourierConfigs((prev) => [...prev, newConfig]);
-
-    const isSteadfast = (configData.code || configData.name || '').toLowerCase().includes('steadfast');
-    if (isSteadfast && (configData.apiKey || configData.secretKey)) {
-      const settingUpdates: Partial<StoreSettings> = {};
-      if (configData.apiKey) settingUpdates.steadfastApiKey = configData.apiKey.trim();
-      if (configData.secretKey) settingUpdates.steadfastSecretKey = configData.secretKey.trim();
-      updateSettings(settingUpdates).catch((err) => console.warn('Could not sync Steadfast keys to D1 settings:', err));
-    }
 
     // Automatically fire webhook whenever a courier is added
     if (configData.triggerWebhookOnAdd !== false) {
@@ -3273,7 +3284,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const updateCourierConfig = (id: string, updates: Partial<CourierApiConfig>) => {
-    let sanitizedUpdates = { ...updates };
+    let sanitizedUpdates = sanitizeCourierConfig(updates);
     if (sanitizedUpdates.baseUrl && sanitizedUpdates.baseUrl.includes('portal.steadfast.com.bd')) {
       sanitizedUpdates.baseUrl = sanitizedUpdates.baseUrl.replace('portal.steadfast.com.bd', 'portal.packzy.com');
     }
@@ -3282,20 +3293,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       prev.map((c) => (c.id === id ? { ...c, ...sanitizedUpdates } : c))
     );
 
-    // If updating Steadfast courier credentials, sync to authoritative store settings
     const target = courierConfigs.find((c) => c.id === id);
-    const isSteadfast =
-      target?.code.toLowerCase().includes('steadfast') ||
-      target?.name.toLowerCase().includes('steadfast') ||
-      sanitizedUpdates.code?.toLowerCase().includes('steadfast') ||
-      sanitizedUpdates.name?.toLowerCase().includes('steadfast');
-
-    if (isSteadfast && (sanitizedUpdates.apiKey !== undefined || sanitizedUpdates.secretKey !== undefined)) {
-      const settingUpdates: Partial<StoreSettings> = {};
-      if (sanitizedUpdates.apiKey !== undefined) settingUpdates.steadfastApiKey = sanitizedUpdates.apiKey.trim();
-      if (sanitizedUpdates.secretKey !== undefined) settingUpdates.steadfastSecretKey = sanitizedUpdates.secretKey.trim();
-      updateSettings(settingUpdates).catch((err) => console.warn('Could not sync Steadfast keys to D1 settings:', err));
-    }
 
     // Trigger courier.updated webhook
     setTimeout(() => {
@@ -3740,18 +3738,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       4000
     );
 
-    // Resolve API credentials
-    const effectiveApiKey = parcelData?.apiKey || targetCourier?.apiKey || (isSteadfast ? settings.steadfastApiKey : undefined);
-    const effectiveSecretKey = parcelData?.secretKey || targetCourier?.secretKey || (isSteadfast ? settings.steadfastSecretKey : undefined);
+    // Resolve courier details - server uses Worker secrets for credentials
     const effectiveBaseUrl = parcelData?.baseUrl || targetCourier?.baseUrl;
     const effectiveTrackingPattern = parcelData?.trackingUrlPattern || targetCourier?.trackingUrlPattern;
 
     const courierPayload = {
-      ...targetCourier,
+      id: targetCourier?.id,
       code: courierCode,
       name: courierName,
-      apiKey: effectiveApiKey,
-      secretKey: effectiveSecretKey,
       baseUrl: effectiveBaseUrl,
       trackingUrlPattern: effectiveTrackingPattern,
     };
@@ -4179,7 +4173,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
       // Update optional localStorage cache ONLY after verified D1 persistence
       try {
-        const json = JSON.stringify(canonical);
+        const json = JSON.stringify(sanitizeSettingsForBrowserStorage(canonical));
         localStorage.setItem(STORAGE_KEYS.SETTINGS, json);
         localStorage.setItem('rongdhonu_settings', json);
       } catch (e) {

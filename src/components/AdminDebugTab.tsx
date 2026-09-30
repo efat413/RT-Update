@@ -184,14 +184,14 @@ export const AdminDebugTab: React.FC<AdminDebugTabProps> = ({ onNavigateTab }) =
 
     // 3. Courier API Setup
     const steadfast = courierConfigs.find((c) => c.code.toLowerCase().includes('steadfast'));
-    if (!steadfast || !steadfast.apiKey || steadfast.apiKey.includes('YOUR_')) {
+    if (!steadfast || !steadfast.isActive) {
       list.push({
         id: 'warn-courier-api',
         category: 'courier',
         severity: 'warning',
-        title: 'Steadfast Courier API Key Running in Sandbox / Simulation Mode',
+        title: 'Steadfast Courier Gateway Inactive',
         description:
-          'Default demo Steadfast API key is active. Simulated bookings generate valid consignment waybills. For live dispatch, configure your merchant credentials.',
+          'Steadfast Courier gateway is currently inactive. Ensure the gateway is enabled in Couriers Tab and Cloudflare Worker Secrets (STEADFAST_API_KEY, STEADFAST_SECRET_KEY) are configured.',
         fixTab: 'couriers',
         fixActionLabel: 'Configure Courier API',
       });

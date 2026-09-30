@@ -89,40 +89,50 @@ npm run deploy
 
 ---
 
-## 🚚 Steadfast Courier API Integration: Setting API Credentials
+## 🚚 Steadfast Courier API Integration: Secure Worker Secrets Architecture
 
-When booking a parcel via Steadfast Courier, the server uses your Steadfast merchant credentials to create parcels and generate waybills. You can set them up using either of the following two methods:
+For production security and compliance, all courier API credentials are strictly isolated on the server and must **never** be stored in client browser storage or public D1 database records.
 
-### Method 1: In the Admin Panel (Easiest — No Terminal Required)
-1. Log in to the Admin Dashboard using your configured administrator credentials.
-2. Navigate to **Store Settings** &rarr; scroll to **Steadfast Courier API Settings** (or go to **Courier APIs** &rarr; edit **Steadfast Courier**).
-3. Paste your **API Key** and **Secret Key** from your [Steadfast Merchant Portal](https://portal.steadfast.com.bd/).
-4. Click **Test Connection & Balance** to verify your balance.
-5. Click **Save Store Settings**. The keys are saved directly into your Cloudflare D1 database and automatically used for all future order dispatches.
+Production Steadfast credentials must be configured exclusively as encrypted **Cloudflare Worker Secrets**:
+- `STEADFAST_API_KEY`: Merchant API Key from the Steadfast Merchant Portal
+- `STEADFAST_SECRET_KEY`: Merchant Secret Key from the Steadfast Merchant Portal
+- `COURIER_WEBHOOK_SECRET`: Secret key used for authenticating incoming delivery webhook notifications and HMAC signatures
 
-*Tip: You can also enter the keys directly inside the parcel dispatch modal whenever you book an order.*
-
-### Method 2: In Cloudflare Worker Secrets (Recommended for Enterprise/Production)
-You can store your credentials as encrypted environment secrets in your Cloudflare Worker:
-
+### Step 1: Configure Cloudflare Worker Secrets
+Using Wrangler CLI:
 ```bash
-# 1. (REQUIRED) Set Admin Authentication Secret (must be a strong random secret):
+# 1. (REQUIRED) Admin Authentication Secret:
 npx wrangler secret put ADMIN_SECRET
 
-# 2. Set the Steadfast API Key:
+# 2. Steadfast Courier API Key:
 npx wrangler secret put STEADFAST_API_KEY
-# Enter your Steadfast API key when prompted and press Enter
 
-# 3. Set the Steadfast Secret Key:
+# 3. Steadfast Courier Secret Key:
 npx wrangler secret put STEADFAST_SECRET_KEY
-# Enter your Steadfast secret key when prompted and press Enter
+
+# 4. Courier Webhook Signature Verification Secret:
+npx wrangler secret put COURIER_WEBHOOK_SECRET
 ```
 
-Alternatively, configure them in the **Cloudflare Dashboard**:
-1. Go to **Workers & Pages** &rarr; select **rt** &rarr; **Settings** &rarr; **Variables and Secrets**.
-2. Click **Add** under **Environment Variables / Secrets**:
-   - `ADMIN_SECRET`: *(REQUIRED: Cloudflare Worker Secret used for HMAC session token signing; fails closed if unconfigured)*
-   - `STEADFAST_API_KEY`: *(Your Steadfast merchant API Key)*
-   - `STEADFAST_SECRET_KEY`: *(Your Steadfast merchant Secret Key)*
+Or via the Cloudflare Dashboard:
+1. Open **Workers & Pages** &rarr; select **rt** &rarr; **Settings** &rarr; **Variables and Secrets**.
+2. Click **Add** under **Environment Variables / Secrets** (select **Secret** type):
+   - `ADMIN_SECRET`
+   - `STEADFAST_API_KEY`
+   - `STEADFAST_SECRET_KEY`
+   - `COURIER_WEBHOOK_SECRET`
 3. Click **Deploy**.
+
+---
+
+### Step 2: Legacy D1 Database Credentials Migration & Cleanup
+
+If you have an existing D1 database where credentials were previously saved in `store_settings`:
+1. **Verify Worker Secrets**: Confirm `STEADFAST_API_KEY` and `STEADFAST_SECRET_KEY` are provisioned in Cloudflare.
+2. **Check Status**: In the Admin Portal &rarr; Couriers tab, or via `GET /api/admin/courier/credentials/status`.
+3. **Execute Safe Cleanup**:
+   - Run the automated admin cleanup: `POST /api/admin/courier/cleanup-legacy-credentials`
+   - Or apply migration 0014: `npx wrangler d1 migrations apply rongdhonu-db --remote`
+4. The cleanup removes `steadfastApiKey` and `steadfastSecretKey` from D1 `settings_json` while preserving all other store branding and preferences.
+
 

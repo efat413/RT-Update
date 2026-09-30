@@ -1438,7 +1438,7 @@ export const AdminPanel: React.FC = () => {
   // --- COURIER PARCEL BOOKING HANDLERS ---
   const openCourierBookingModal = (order: Order, preferredCourier?: string) => {
     setCourierModalOrder(order);
-    const activeCourier = courierConfigs.find((c) => c.isActive && (c.apiKey || (c.code.toLowerCase().includes('steadfast') && settings.steadfastApiKey)))?.code;
+    const activeCourier = courierConfigs.find((c) => c.isActive)?.code;
     const chosenCourier = preferredCourier || rowSelectedCouriers[order.id] || order.courierBooking?.provider || order.courierName || activeCourier || courierConfigs[0]?.code || 'Steadfast';
     setSelectedCourier(chosenCourier);
     setCourierBookingError(null);
@@ -1473,35 +1473,17 @@ export const AdminPanel: React.FC = () => {
 
     setCourierNote(order.customer.notes || `Order #${order.orderNumber} - Rongdhonu Trade`);
 
-    // Pre-populate credentials for chosen courier
-    const isSf = chosenCourier.toLowerCase().includes('steadfast');
-    const cfg = courierConfigs.find(
-      (c) => c.code.toLowerCase() === chosenCourier.toLowerCase() || c.name.toLowerCase() === chosenCourier.toLowerCase() || c.id === chosenCourier
-    );
-    if (isSf) {
-      setInlineSfApiKey(settings.steadfastApiKey || cfg?.apiKey || '');
-      setInlineSfSecretKey(settings.steadfastSecretKey || cfg?.secretKey || '');
-    } else {
-      setInlineSfApiKey(cfg?.apiKey || '');
-      setInlineSfSecretKey(cfg?.secretKey || '');
-    }
+    // Reset temporary validation keys on open
+    setInlineSfApiKey('');
+    setInlineSfSecretKey('');
     setCourierBookingError(null);
   };
 
   const handleModalCourierChange = (newCourier: string) => {
     setSelectedCourier(newCourier);
     setCourierBookingError(null);
-    const isSf = newCourier.toLowerCase().includes('steadfast');
-    const cfg = courierConfigs.find(
-      (c) => c.code.toLowerCase() === newCourier.toLowerCase() || c.name.toLowerCase() === newCourier.toLowerCase() || c.id === newCourier
-    );
-    if (isSf) {
-      setInlineSfApiKey(settings.steadfastApiKey || cfg?.apiKey || '');
-      setInlineSfSecretKey(settings.steadfastSecretKey || cfg?.secretKey || '');
-    } else {
-      setInlineSfApiKey(cfg?.apiKey || '');
-      setInlineSfSecretKey(cfg?.secretKey || '');
-    }
+    setInlineSfApiKey('');
+    setInlineSfSecretKey('');
   };
 
   const handleExecuteCourierBooking = async (e?: React.FormEvent) => {
@@ -1594,19 +1576,9 @@ export const AdminPanel: React.FC = () => {
       } as any);
 
       if (res.success) {
-        if (inlineSfApiKey.trim()) {
-          if (isSf) {
-            updateSettings({
-              steadfastApiKey: inlineSfApiKey.trim(),
-              steadfastSecretKey: inlineSfSecretKey.trim() || undefined,
-            }).catch(() => {});
-          } else if (chosenConfig?.id) {
-            updateCourierConfig(chosenConfig.id, {
-              apiKey: inlineSfApiKey.trim(),
-              secretKey: inlineSfSecretKey.trim() || undefined,
-            });
-          }
-        }
+        // Clear any temporary credentials from component state immediately
+        setInlineSfApiKey('');
+        setInlineSfSecretKey('');
         if (res.trackingCode) {
           const pattern = chosenConfig?.trackingUrlPattern || (isSf ? 'https://steadfast.com.bd/t/{trackingCode}' : 'https://steadfast.com.bd/t/{trackingCode}');
           const trackingUrl = pattern.includes('{trackingCode}') ? pattern.replace('{trackingCode}', res.trackingCode) : `${pattern}/${res.trackingCode}`;
@@ -6733,7 +6705,8 @@ export const AdminPanel: React.FC = () => {
                     (c) => c.code.toLowerCase() === selectedCourier.toLowerCase() || c.name.toLowerCase() === selectedCourier.toLowerCase() || c.id === selectedCourier
                   ) || courierConfigs[0];
                   const isConfigured = Boolean(
-                    (selectedCourier.toLowerCase().includes('steadfast') && (settings.steadfastApiKey || currentConfig?.apiKey)) ||
+                    (selectedCourier.toLowerCase().includes('steadfast') && Boolean(settings.steadfastApiKey || currentConfig?.hasCredentials)) ||
+                    currentConfig?.hasCredentials ||
                     currentConfig?.apiKey
                   );
                   return (
@@ -6773,8 +6746,8 @@ export const AdminPanel: React.FC = () => {
                   (c) => c.code.toLowerCase() === selectedCourier.toLowerCase() || c.name.toLowerCase() === selectedCourier.toLowerCase() || c.id === selectedCourier
                 );
                 const hasKey = isSf
-                  ? Boolean(settings.steadfastApiKey || inlineSfApiKey.trim() || currentConfig?.apiKey)
-                  : Boolean(currentConfig?.apiKey || inlineSfApiKey.trim());
+                  ? Boolean(settings.steadfastApiKey || inlineSfApiKey.trim() || currentConfig?.hasCredentials)
+                  : Boolean(currentConfig?.hasCredentials || currentConfig?.apiKey || inlineSfApiKey.trim());
                 const isMissing = !hasKey || (courierBookingError && courierBookingError.toLowerCase().includes('credential'));
                 if (!isMissing) return null;
 

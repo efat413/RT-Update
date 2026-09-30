@@ -128,12 +128,12 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
     setEditingCourier(c);
     setName(c.name);
     setCode(c.code);
-    setApiKey(c.apiKey);
-    setSecretKey(c.secretKey || '');
+    setApiKey('');
+    setSecretKey('');
     setBaseUrl(c.baseUrl || '');
     setTrackingUrlPattern(c.trackingUrlPattern || '');
     setWebhookUrl(c.webhookUrl || '');
-    setWebhookSecret(c.webhookSecret || '');
+    setWebhookSecret('');
     setTriggerWebhookOnAdd(c.triggerWebhookOnAdd !== false);
     setIsActive(c.isActive);
     setIsModalOpen(true);
@@ -141,7 +141,7 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !apiKey.trim() || !baseUrl.trim()) return;
+    if (!name.trim() || !baseUrl.trim()) return;
 
     const formattedCode = (code || name).toLowerCase().replace(/[^a-z0-9]+/g, '-');
     let sanitizedBaseUrl = baseUrl.trim();
@@ -154,12 +154,9 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
       onUpdateCourier(editingCourier.id, {
         name,
         code: formattedCode,
-        apiKey: apiKey.trim(),
-        secretKey: secretKey ? secretKey.trim() : undefined,
         baseUrl: sanitizedBaseUrl,
         trackingUrlPattern: trackingUrlPattern || undefined,
         webhookUrl: webhookUrl.trim() || undefined,
-        webhookSecret: webhookSecret ? webhookSecret.trim() : undefined,
         triggerWebhookOnAdd,
         isActive,
       });
@@ -168,12 +165,9 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
       onAddCourier({
         name,
         code: formattedCode,
-        apiKey: apiKey.trim(),
-        secretKey: secretKey ? secretKey.trim() : undefined,
         baseUrl: sanitizedBaseUrl,
         trackingUrlPattern: trackingUrlPattern || undefined,
         webhookUrl: webhookUrl.trim() || undefined,
-        webhookSecret: webhookSecret ? webhookSecret.trim() : undefined,
         triggerWebhookOnAdd,
         isActive,
       });
@@ -570,44 +564,14 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
                   <div>
                     <div className="flex items-center justify-between">
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                        API Key
+                        API Credentials Architecture
                       </span>
-                      {c.apiKey && (
-                        <button
-                          onClick={() => toggleKeyVisibility(c.id)}
-                          className="text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
-                          title={isRevealed ? 'Hide API Key' : 'Reveal API Key'}
-                        >
-                          {isRevealed ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                        </button>
-                      )}
                     </div>
-                    <span className="font-mono text-[11px] text-slate-900 font-semibold break-all">
-                      {c.apiKey ? (isRevealed ? c.apiKey : c.apiKey.replace(/.(?=.{4})/g, '•')) : (
-                        <span className="text-amber-600 font-medium">Not configured in UI (Checks Worker Secrets)</span>
-                      )}
-                    </span>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                        Secret Key / Client ID
-                      </span>
-                      {c.secretKey && (
-                        <button
-                          onClick={() => toggleKeyVisibility(c.id)}
-                          className="text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
-                          title={isRevealed ? 'Hide Secret Key' : 'Reveal Secret Key'}
-                        >
-                          {isRevealed ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                        </button>
-                      )}
-                    </div>
-                    <span className="font-mono text-[11px] text-slate-600 break-all">
-                      {c.secretKey ? (isRevealed ? c.secretKey : c.secretKey.replace(/.(?=.{3})/g, '•')) : (
-                        <span className="text-slate-400">Optional / Worker Secret</span>
-                      )}
+                    <span className="font-mono text-[11px] text-emerald-700 font-semibold break-all flex items-center gap-1.5 mt-0.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      {c.code.toLowerCase().includes('steadfast')
+                        ? 'Production Worker Secrets (STEADFAST_API_KEY & STEADFAST_SECRET_KEY)'
+                        : 'Server-side Environment Secrets'}
                     </span>
                   </div>
 
@@ -1059,31 +1023,40 @@ export const AdminCouriersTab: React.FC<AdminCouriersTabProps> = ({
                 </div>
               </div>
 
+              <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-800 space-y-1">
+                <div className="font-bold flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>Production Credentials Security Architecture</span>
+                </div>
+                <p className="text-[11px] text-emerald-700 leading-relaxed">
+                  Production credentials reside exclusively in Cloudflare Worker Secrets (<code className="font-mono bg-emerald-100 px-1 py-0.5 rounded">STEADFAST_API_KEY</code> &amp; <code className="font-mono bg-emerald-100 px-1 py-0.5 rounded">STEADFAST_SECRET_KEY</code>). Any keys entered below are used only for immediate server connection validation and are never persisted in browser storage or D1 database.
+                </p>
+              </div>
+
               <div>
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  API Key / Access Token *
+                  API Key / Access Token (Validation Test Only)
                 </label>
                 <input
                   id="courier-api-key-input"
                   type="text"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="Paste merchant API key provided by the courier"
+                  placeholder="Optional: Enter key to test immediate connection"
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500"
-                  required
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Secret Key / Client Secret (Optional)
+                  Secret Key / Client Secret (Validation Test Only)
                 </label>
                 <input
                   id="courier-secret-key-input"
                   type="text"
                   value={secretKey}
                   onChange={(e) => setSecretKey(e.target.value)}
-                  placeholder="Secret key or OAuth client secret if required"
+                  placeholder="Optional: Enter secret to test immediate connection"
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500"
                 />
               </div>

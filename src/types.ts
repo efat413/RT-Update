@@ -80,8 +80,10 @@ export interface CourierApiConfig {
   id: string;
   name: string;
   code: string;
-  apiKey: string;
+  // Security note: API keys and secrets must NEVER be persisted to browser storage or returned in plaintext
+  apiKey?: string;
   secretKey?: string;
+  hasCredentials?: boolean;
   baseUrl?: string;
   trackingUrlPattern: string;
   isActive: boolean;

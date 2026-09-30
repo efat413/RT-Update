@@ -554,8 +554,12 @@ function localApiDevPlugin(): Plugin {
     }
     const safeAdminSettings = { ...settings };
     if (canViewCourierCredentials) {
-      safeAdminSettings.steadfastApiKey = settings.steadfastApiKey ? '••••••••' : '';
-      safeAdminSettings.steadfastSecretKey = settings.steadfastSecretKey ? '••••••••' : '';
+      const hasConfigured = Boolean(
+        process.env.STEADFAST_API_KEY ||
+        (settings.steadfastApiKey && settings.steadfastApiKey !== '')
+      );
+      safeAdminSettings.steadfastApiKey = hasConfigured ? '••••••••' : '';
+      safeAdminSettings.steadfastSecretKey = hasConfigured ? '••••••••' : '';
       if (Array.isArray(settings.courierWebhooks)) {
         safeAdminSettings.courierWebhooks = maskDevCourierWebhooks(settings.courierWebhooks);
       }
@@ -2087,13 +2091,9 @@ function localApiDevPlugin(): Plugin {
                   ? updates.topBarAnnouncementText
                   : (updates.announcementText !== undefined ? updates.announcementText : undefined);
 
-                // Preserve secret courier keys if masked asterisks are received
-                if (updates.steadfastApiKey === '••••••••' || updates.steadfastApiKey?.startsWith('****')) {
-                  updates.steadfastApiKey = devSettings.steadfastApiKey;
-                }
-                if (updates.steadfastSecretKey === '••••••••' || updates.steadfastSecretKey?.startsWith('****')) {
-                  updates.steadfastSecretKey = devSettings.steadfastSecretKey;
-                }
+                // Courier credentials must NEVER be persisted into store settings
+                delete updates.steadfastApiKey;
+                delete updates.steadfastSecretKey;
                 if (Array.isArray(updates.courierWebhooks)) {
                   const existingMap = new Map<string, string>();
                   for (const w of devCourierWebhooks) {
@@ -3312,14 +3312,59 @@ function localApiDevPlugin(): Plugin {
         }
 
         // Courier endpoints in dev
+        if (url.pathname === '/api/admin/courier/credentials/status' && method === 'GET') {
+          const authResult = requireDevAuth(req);
+          const permErr = requireDevPermission(authResult, 'courier.configure');
+          if (permErr) return sendDevError(res, permErr);
+
+          const hasWorkerApiKey = Boolean(process.env.STEADFAST_API_KEY && process.env.STEADFAST_API_KEY.trim().length > 0);
+          const hasWorkerSecretKey = Boolean(process.env.STEADFAST_SECRET_KEY && process.env.STEADFAST_SECRET_KEY.trim().length > 0);
+          const hasWorkerWebhookSecret = Boolean(process.env.COURIER_WEBHOOK_SECRET && process.env.COURIER_WEBHOOK_SECRET.trim().length > 0);
+          const hasLegacyApiKey = Boolean(devSettings.steadfastApiKey && devSettings.steadfastApiKey.trim().length > 0);
+          const hasLegacySecretKey = Boolean(devSettings.steadfastSecretKey && devSettings.steadfastSecretKey.trim().length > 0);
+
+          res.statusCode = 200;
+          return res.end(JSON.stringify({
+            success: true,
+            workerSecretsConfigured: {
+              apiKey: hasWorkerApiKey,
+              secretKey: hasWorkerSecretKey,
+              webhookSecret: hasWorkerWebhookSecret,
+            },
+            legacyD1Credentials: {
+              detected: hasLegacyApiKey || hasLegacySecretKey,
+              hasApiKey: hasLegacyApiKey,
+              hasSecretKey: hasLegacySecretKey,
+            },
+            migrationSafe: hasWorkerApiKey && hasWorkerSecretKey,
+            instructions: 'Configure Cloudflare Worker Secrets: npx wrangler secret put STEADFAST_API_KEY and npx wrangler secret put STEADFAST_SECRET_KEY. Then trigger cleanup via POST /api/admin/courier/cleanup-legacy-credentials.',
+          }));
+        }
+
+        if (url.pathname === '/api/admin/courier/cleanup-legacy-credentials' && method === 'POST') {
+          const authResult = requireDevAuth(req);
+          const permErr = requireDevPermission(authResult, 'settings.manage');
+          if (permErr) return sendDevError(res, permErr);
+
+          delete devSettings.steadfastApiKey;
+          delete devSettings.steadfastSecretKey;
+
+          res.statusCode = 200;
+          return res.end(JSON.stringify({
+            success: true,
+            cleaned: true,
+            message: 'Legacy courier credentials were safely removed from settings.',
+          }));
+        }
+
         if (url.pathname === '/api/courier/steadfast/test' && method === 'POST') {
           const authResult = requireDevAuth(req);
           const permErr = requireDevPermission(authResult, 'courier.configure');
           if (permErr) return sendDevError(res, permErr);
 
           return readBody(async (body) => {
-            const apiKey = (body?.apiKey || process.env.STEADFAST_API_KEY || devSettings.steadfastApiKey || '').trim();
-            const secretKey = (body?.secretKey || process.env.STEADFAST_SECRET_KEY || devSettings.steadfastSecretKey || '').trim();
+            const apiKey = (body?.apiKey || process.env.STEADFAST_API_KEY || '').trim();
+            const secretKey = (body?.secretKey || process.env.STEADFAST_SECRET_KEY || '').trim();
             const baseUrl = body?.baseUrl;
 
             if (apiKey && secretKey) {
@@ -3328,9 +3373,6 @@ function localApiDevPlugin(): Plugin {
                 const sfData = callResult.data || {};
 
                 if (callResult.ok && (sfData.status === 200 || sfData.current_balance !== undefined || sfData.balance !== undefined)) {
-                  if (body?.apiKey) devSettings.steadfastApiKey = body.apiKey;
-                  if (body?.secretKey) devSettings.steadfastSecretKey = body.secretKey;
-
                   res.statusCode = 200;
                   return res.end(JSON.stringify({
                     success: true,
@@ -3355,7 +3397,7 @@ function localApiDevPlugin(): Plugin {
             res.statusCode = 400;
             return res.end(JSON.stringify({
               success: false,
-              error: 'Steadfast Courier API credentials are not configured on the server. Please enter API Key and Secret Key.',
+              error: 'Steadfast Courier API credentials are not configured in Worker secrets or provided in request.',
             }));
           });
         }
@@ -3410,19 +3452,16 @@ function localApiDevPlugin(): Plugin {
             const recipientPhone = (parcelData.recipient_phone || order.customer?.phone || '').replace(/[^0-9]/g, '');
 
             if (isSteadfast) {
-              const apiKey = courierParam.apiKey || body?.apiKey || process.env.STEADFAST_API_KEY || devSettings.steadfastApiKey;
-              const secretKey = courierParam.secretKey || body?.secretKey || process.env.STEADFAST_SECRET_KEY || devSettings.steadfastSecretKey;
+              const apiKey = (process.env.STEADFAST_API_KEY || '').trim();
+              const secretKey = (process.env.STEADFAST_SECRET_KEY || '').trim();
 
               if (!apiKey || !secretKey) {
                 res.statusCode = 400;
                 return res.end(JSON.stringify({
                   success: false,
-                  error: 'Steadfast Courier API credentials are not configured. Please enter your Steadfast API Key and Secret Key in the Admin Panel (under Courier APIs or Store Settings), or set STEADFAST_API_KEY and STEADFAST_SECRET_KEY in Cloudflare Worker secrets.',
+                  error: 'Steadfast Courier API credentials are not configured in Worker secrets.',
                 }));
               }
-
-              if (body?.apiKey) devSettings.steadfastApiKey = body.apiKey;
-              if (body?.secretKey) devSettings.steadfastSecretKey = body.secretKey;
 
               try {
                 const sfPayload: Record<string, any> = {
@@ -3627,11 +3666,11 @@ function localApiDevPlugin(): Plugin {
             }
           }
 
-          const apiKey = process.env.STEADFAST_API_KEY || devSettings.steadfastApiKey;
-          const secretKey = process.env.STEADFAST_SECRET_KEY || devSettings.steadfastSecretKey;
+          const apiKey = (process.env.STEADFAST_API_KEY || '').trim();
+          const secretKey = (process.env.STEADFAST_SECRET_KEY || '').trim();
           if (!apiKey || !secretKey) {
             res.statusCode = 400;
-            return res.end(JSON.stringify({ success: false, error: 'Steadfast credentials not configured on server.' }));
+            return res.end(JSON.stringify({ success: false, error: 'Steadfast Courier API credentials are not configured in Worker secrets.' }));
           }
 
           try {
@@ -4040,7 +4079,7 @@ function localApiDevPlugin(): Plugin {
               'X-Webhook-Timestamp': new Date().toISOString(),
             };
             const serializedTestPayload = JSON.stringify(testPayload);
-            const effectiveTestSecret = secret || (process.env.COURIER_WEBHOOK_SECRET || process.env.STEADFAST_SECRET_KEY || devSettings.steadfastSecretKey || '').trim();
+            const effectiveTestSecret = secret || (process.env.COURIER_WEBHOOK_SECRET || process.env.STEADFAST_SECRET_KEY || '').trim();
             if (effectiveTestSecret) {
               headers['X-Webhook-Secret'] = effectiveTestSecret;
               const sig = await computeHmacSha256Hex(effectiveTestSecret, serializedTestPayload);
@@ -4175,7 +4214,7 @@ function localApiDevPlugin(): Plugin {
                   'X-Webhook-Timestamp': new Date().toISOString(),
                 };
                 const serializedPayload = JSON.stringify(payload);
-                const effectiveTriggerSecret = t.secret || (process.env.COURIER_WEBHOOK_SECRET || process.env.STEADFAST_SECRET_KEY || devSettings.steadfastSecretKey || '').trim();
+                const effectiveTriggerSecret = t.secret || (process.env.COURIER_WEBHOOK_SECRET || process.env.STEADFAST_SECRET_KEY || '').trim();
                 if (effectiveTriggerSecret) {
                   headers['X-Webhook-Secret'] = effectiveTriggerSecret;
                   const sig = await computeHmacSha256Hex(effectiveTriggerSecret, serializedPayload);
