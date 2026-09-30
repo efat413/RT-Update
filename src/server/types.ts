@@ -49,12 +49,17 @@ export interface Env {
   ASSETS?: {
     fetch: (request: Request) => Promise<Response>;
   };
+  ADMIN_SECRET?: string;
+  COURIER_WEBHOOK_SECRET?: string;
   STEADFAST_API_KEY?: string;
   STEADFAST_SECRET_KEY?: string;
-  ADMIN_SECRET?: string;
   RESEND_API_KEY?: string;
   RESEND_FROM_EMAIL?: string;
   APP_URL?: string;
+  PRODUCTION_ORIGIN?: string;
+  ALLOWED_ORIGINS?: string;
+  SUPER_ADMIN_EMAILS?: string;
+  SUPER_ADMIN_USER_IDS?: string;
   [key: string]: any;
 }
 
