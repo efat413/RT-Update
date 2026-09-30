@@ -2911,9 +2911,16 @@ export async function getAuditLogsFromD1(
 }
 
 /**
- * Checks if a courier webhook request fingerprint has already been processed within the TTL window.
- * If not already present, records the fingerprint in D1 to prevent replay attacks.
- * Includes opportunistic pruning to prevent unbounded table growth.
+ * Atomically checks and records a courier webhook request fingerprint.
+ * Prevents race conditions and duplicate processing from concurrent or replayed requests.
+ *
+ * Implements atomic registration using the PRIMARY KEY constraint on `webhook_replays(fingerprint)`.
+ * Eliminates the SELECT-then-INSERT race condition:
+ * 1. Opportunistically prunes expired records (where expires_at < now) to maintain table efficiency.
+ * 2. Atomically attempts to insert the fingerprint.
+ * 3. If the fingerprint already exists (concurrent request or unexpired replay), the PRIMARY KEY constraint
+ *    conflicts and is safely identified as a duplicate/replay (isReplay: true).
+ * 4. Avoids logging sensitive payload data or expected constraint violations.
  */
 export async function checkAndRecordWebhookFingerprint(
   db: D1Database,
@@ -2926,27 +2933,59 @@ export async function checkAndRecordWebhookFingerprint(
 
   try {
     // 1. Opportunistic lazy cleanup of expired entries (keeps table compact without unbounded growth)
-    await db.prepare('DELETE FROM webhook_replays WHERE expires_at < ?').bind(now).run().catch(() => {});
-
-    // 2. Check if fingerprint exists and has not expired
-    const existing = await db
-      .prepare('SELECT fingerprint FROM webhook_replays WHERE fingerprint = ? AND expires_at > ?')
-      .bind(fingerprint, now)
-      .first();
-
-    if (existing) {
-      return { isReplay: true };
-    }
-
-    // 3. Insert new fingerprint record
     await db
-      .prepare('INSERT OR REPLACE INTO webhook_replays (fingerprint, created_at, expires_at) VALUES (?, ?, ?)')
+      .prepare('DELETE FROM webhook_replays WHERE expires_at < ?')
+      .bind(now)
+      .run()
+      .catch(() => {});
+
+    // 2. Atomic insertion: Attempt to register the fingerprint directly.
+    // The PRIMARY KEY (UNIQUE) constraint on `webhook_replays(fingerprint)` guarantees atomicity:
+    // exactly one concurrent request can successfully insert this fingerprint.
+    const insertRes = await db
+      .prepare('INSERT INTO webhook_replays (fingerprint, created_at, expires_at) VALUES (?, ?, ?)')
       .bind(fingerprint, now, expiresAt)
       .run();
 
+    const changes = insertRes.meta?.changes ?? (insertRes as any)?.changes ?? insertRes.meta?.rows_written ?? 1;
+    if (changes === 0) {
+      // Row was ignored or not inserted due to conflict
+      return { isReplay: true };
+    }
+
+    // Successfully claimed and registered fingerprint
     return { isReplay: false };
-  } catch (err) {
-    console.warn('Error checking/recording webhook fingerprint in D1:', err);
+  } catch (err: any) {
+    const errMsg = (err?.message || String(err)).toLowerCase();
+
+    // Catch UNIQUE / PRIMARY KEY constraint violations (conflict with existing fingerprint)
+    if (
+      errMsg.includes('unique') ||
+      errMsg.includes('constraint') ||
+      errMsg.includes('primary key') ||
+      errMsg.includes('sqlite_constraint') ||
+      errMsg.includes('already exists') ||
+      errMsg.includes('d1_error')
+    ) {
+      // Replay / concurrent duplicate detected atomically via database constraint
+      return { isReplay: true };
+    }
+
+    // Safety fallback: verify if the unexpired fingerprint exists in the database
+    try {
+      const existing = await db
+        .prepare('SELECT fingerprint FROM webhook_replays WHERE fingerprint = ? AND expires_at >= ?')
+        .bind(fingerprint, now)
+        .first();
+
+      if (existing) {
+        return { isReplay: true };
+      }
+    } catch {
+      // Ignore fallback query failure
+    }
+
+    console.warn('Unexpected non-constraint database error recording webhook replay fingerprint:', err?.message || err);
     return { isReplay: false };
   }
 }

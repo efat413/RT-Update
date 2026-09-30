@@ -302,6 +302,38 @@ async function runHardeningVerification() {
     '2.4 Replaying the EXACT same signed webhook request is REJECTED (HTTP 409 Conflict Replay Deduplication)'
   );
 
+  // Test 2.4b: Concurrent duplicate webhook requests -> only one is processed (HTTP 200 vs HTTP 409)
+  const concurrentTimestamp = (Date.now() + 500).toString();
+  const concurrentBody = JSON.stringify({
+    ping: true,
+    action: 'test_ping',
+    event: 'test.ping',
+    source: 'automated-hardening-test-concurrent',
+    testId: `concurrent-${Date.now()}`,
+  });
+  const concurrentSig = await computeHmacSha256Hex(webhookSecret, `${concurrentTimestamp}.${concurrentBody}`);
+
+  const concurrentPromises = Array.from({ length: 4 }).map(() =>
+    fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Webhook-Timestamp': concurrentTimestamp,
+        'X-Webhook-Signature': `sha256=${concurrentSig}`,
+      },
+      body: concurrentBody,
+    })
+  );
+  const concurrentResponses = await Promise.all(concurrentPromises);
+  const concurrentCodes = concurrentResponses.map((r) => r.status);
+  const pass200Count = concurrentCodes.filter((s) => s === 200).length;
+  const pass409Count = concurrentCodes.filter((s) => s === 409).length;
+
+  assert(
+    pass200Count === 1 && pass409Count === 3,
+    `2.4b Concurrent duplicate webhook requests: Exactly 1 accepted (HTTP 200), 3 rejected as duplicate (HTTP 409) [counts: 200=${pass200Count}, 409=${pass409Count}]`
+  );
+
   // Test 5: Different valid webhook -> accepted (200)
   const differentTimestamp = (Date.now() + 1000).toString();
   const differentBody = JSON.stringify({

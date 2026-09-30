@@ -214,6 +214,21 @@ function localApiDevPlugin(): Plugin {
   const devOrderIdempotencyMap = new Map<string, { order: any; timestamp: number }>();
   const devWebhookReplays = new Map<string, { createdAt: number; expiresAt: number }>();
 
+  const checkAndRecordDevWebhookReplay = (fingerprint: string, ttlSeconds: number = 600): { isReplay: boolean } => {
+    const now = Date.now();
+    // Opportunistic cleanup of expired entries
+    for (const [k, v] of devWebhookReplays.entries()) {
+      if (v.expiresAt < now) devWebhookReplays.delete(k);
+    }
+    const existing = devWebhookReplays.get(fingerprint);
+    if (existing && existing.expiresAt > now) {
+      return { isReplay: true };
+    }
+    // Atomically claim fingerprint
+    devWebhookReplays.set(fingerprint, { createdAt: now, expiresAt: now + ttlSeconds * 1000 });
+    return { isReplay: false };
+  };
+
   const checkDevRateLimit = (key: string, limit: number, windowSeconds: number): boolean => {
     const now = Date.now();
     const entry = devRateLimits.get(key);
@@ -3610,20 +3625,14 @@ function localApiDevPlugin(): Plugin {
               ) as string;
 
               const fingerprint = await computeWebhookFingerprint(rawBody, timestampHeader, sigOrSecret);
-              const nowTime = Date.now();
-              // Prune expired
-              for (const [k, v] of devWebhookReplays.entries()) {
-                if (v.expiresAt < nowTime) devWebhookReplays.delete(k);
-              }
-              const existingReplay = devWebhookReplays.get(fingerprint);
-              if (existingReplay && existingReplay.expiresAt > nowTime) {
+              const { isReplay } = checkAndRecordDevWebhookReplay(fingerprint, 600);
+              if (isReplay) {
                 res.statusCode = 409;
                 return res.end(JSON.stringify({
                   success: false,
                   error: 'Webhook replay rejected: This webhook request has already been processed.',
                 }));
               }
-              devWebhookReplays.set(fingerprint, { createdAt: nowTime, expiresAt: nowTime + 600 * 1000 });
 
               const nowIso = new Date().toISOString();
               const isPing =
