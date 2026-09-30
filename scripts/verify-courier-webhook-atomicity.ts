@@ -293,6 +293,81 @@ async function runWebhookAtomicityVerification() {
     'B.7 Webhook with malformed timestamp header is REJECTED (HTTP 400 Bad Request)'
   );
 
+  // Test B.8: Missing timestamp header with signature -> REJECTED (400)
+  const testB8Res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Signature': `sha256=${validSig}`,
+    },
+    body: validBody,
+  });
+  assert(
+    testB8Res.status === 400,
+    'B.8 Webhook with missing timestamp header is REJECTED (HTTP 400 Bad Request)'
+  );
+
+  // Test B.9: Future timestamp outside 5-minute tolerance -> REJECTED (401)
+  const futureTimestamp = (Date.now() + 10 * 60 * 1000).toString(); // 10 minutes in future
+  const futureSig = await computeHmacSha256Hex(webhookSecret, `${futureTimestamp}.${validBody}`);
+  const testB9Res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Timestamp': futureTimestamp,
+      'X-Webhook-Signature': `sha256=${futureSig}`,
+    },
+    body: validBody,
+  });
+  assert(
+    testB9Res.status === 401,
+    'B.9 Webhook with future out-of-window timestamp is REJECTED (HTTP 401 Replay Protection)'
+  );
+
+  // Test B.10: Shared secret without timestamp header -> REJECTED (400)
+  const testB10Res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': webhookSecret,
+    },
+    body: validBody,
+  });
+  assert(
+    testB10Res.status === 400,
+    'B.10 Webhook with shared secret but missing timestamp header is REJECTED (HTTP 400 Bad Request)'
+  );
+
+  // Test B.11: Shared secret with expired timestamp -> REJECTED (401)
+  const testB11Res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': webhookSecret,
+      'X-Webhook-Timestamp': staleTimestamp,
+    },
+    body: validBody,
+  });
+  assert(
+    testB11Res.status === 401,
+    'B.11 Webhook with shared secret but expired timestamp is REJECTED (HTTP 401 Replay Protection)'
+  );
+
+  // Test B.12: Shared secret with future timestamp -> REJECTED (401)
+  const testB12Res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': webhookSecret,
+      'X-Webhook-Timestamp': futureTimestamp,
+    },
+    body: validBody,
+  });
+  assert(
+    testB12Res.status === 401,
+    'B.12 Webhook with shared secret but future timestamp is REJECTED (HTTP 401 Replay Protection)'
+  );
+
   // ================================================================
   // PART C: STEADFAST COURIER STATUS UPDATE INTEGRATION
   // ================================================================
