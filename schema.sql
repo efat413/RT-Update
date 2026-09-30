@@ -38,6 +38,23 @@ CREATE INDEX IF NOT EXISTS idx_products_category_created_at ON products(category
 CREATE INDEX IF NOT EXISTS idx_products_featured_created_at ON products(featured, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_products_featured_sort_order ON products(featured, featured_sort_order ASC, created_at DESC);
 
+-- Engine-level guard preventing race conditions from overselling below 0
+CREATE TRIGGER IF NOT EXISTS trg_prevent_negative_stock
+BEFORE UPDATE OF stock ON products
+FOR EACH ROW
+WHEN NEW.stock < 0
+BEGIN
+  SELECT RAISE(ABORT, 'INSUFFICIENT_STOCK: Product stock cannot be negative');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_negative_stock_insert
+BEFORE INSERT ON products
+FOR EACH ROW
+WHEN NEW.stock < 0
+BEGIN
+  SELECT RAISE(ABORT, 'INSUFFICIENT_STOCK: Product stock cannot be negative');
+END;
+
 -- 2. CATEGORIES TABLE
 CREATE TABLE IF NOT EXISTS categories (
   id TEXT PRIMARY KEY,

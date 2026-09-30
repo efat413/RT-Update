@@ -2763,6 +2763,15 @@ function localApiDevPlugin(): Plugin {
               }
             }
 
+            const idempotencyKey = ((req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || rawOrder.idempotencyKey || '') as string).trim();
+            if (idempotencyKey) {
+              const cached = devOrderIdempotencyMap.get(idempotencyKey);
+              if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
+                res.statusCode = 200;
+                return res.end(JSON.stringify({ success: true, order: sanitizeDevOrder(cached.order, false), idempotent: true }));
+              }
+            }
+
             const clientIp = ((req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || req.socket?.remoteAddress || '127.0.0.1') as string).trim();
             if (!checkDevRateLimit(`order_burst:${clientIp}`, 2, 10)) {
               res.statusCode = 429;
@@ -2778,12 +2787,21 @@ function localApiDevPlugin(): Plugin {
             }
             recordDevRateAttempt(`order_ip:${clientIp}`, 600);
 
-            const idempotencyKey = ((req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || rawOrder.idempotencyKey || '') as string).trim();
-            if (idempotencyKey) {
-              const cached = devOrderIdempotencyMap.get(idempotencyKey);
-              if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
-                res.statusCode = 200;
-                return res.end(JSON.stringify({ success: true, order: sanitizeDevOrder(cached.order, false), idempotent: true }));
+            // Verify stock availability for all items before placing order
+            for (const it of verifiedItems) {
+              const prod = devProducts.find((p) => p.id === it.product?.id);
+              if (!prod) {
+                res.statusCode = 400;
+                return res.end(JSON.stringify({ success: false, error: `Product "${it.product?.title || it.product?.id}" not found.` }));
+              }
+              if (prod.stock < it.quantity) {
+                res.statusCode = 400;
+                return res.end(
+                  JSON.stringify({
+                    success: false,
+                    error: `One or more items in your cart sold out during checkout. Insufficient stock for "${prod.title}".`,
+                  })
+                );
               }
             }
 
@@ -2808,20 +2826,20 @@ function localApiDevPlugin(): Plugin {
               createdAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
             };
+
+            // Deduct stock in devProducts atomically (all items guaranteed to have stock)
+            for (const it of verifiedItems) {
+              const prod = devProducts.find((p) => p.id === it.product?.id);
+              if (prod) {
+                prod.stock = Math.max(0, prod.stock - it.quantity);
+              }
+            }
+
             devOrders.unshift(order);
             if (idempotencyKey) {
               devOrderIdempotencyMap.set(idempotencyKey, { order, timestamp: Date.now() });
             }
 
-            // Deduct stock in devProducts
-            if (Array.isArray(order.items)) {
-              for (const it of order.items) {
-                if (it?.product?.id) {
-                  const prod = devProducts.find((p) => p.id === it.product.id);
-                  if (prod) prod.stock = Math.max(0, prod.stock - it.quantity);
-                }
-              }
-            }
             res.statusCode = 201;
             return res.end(JSON.stringify({ success: true, order: sanitizeDevOrder(order, false), message: 'Order saved in dev memory store' }));
           });
@@ -2998,6 +3016,18 @@ function localApiDevPlugin(): Plugin {
                       if (it?.product?.id) {
                         const prod = devProducts.find((p) => p.id === it.product.id);
                         if (prod) prod.stock = prod.stock + it.quantity;
+                      }
+                    }
+                  }
+                }
+
+                // Handle uncancelled (reactivating cancelled order)
+                if (old.shippingStatus === 'Cancelled' && updates.shippingStatus && updates.shippingStatus !== 'Cancelled') {
+                  if (Array.isArray(old.items)) {
+                    for (const it of old.items) {
+                      if (it?.product?.id) {
+                        const prod = devProducts.find((p) => p.id === it.product.id);
+                        if (prod) prod.stock = Math.max(0, prod.stock - it.quantity);
                       }
                     }
                   }

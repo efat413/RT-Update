@@ -2270,8 +2270,10 @@ export async function insertOrder(db: D1Database, order: Order): Promise<Order> 
   const stockStatements = verifiedItems.map((it) => {
     const qty = Number(it.quantity) || 1;
     return db
-      .prepare('UPDATE products SET stock = stock - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND stock >= ?')
-      .bind(qty, it.product.id, qty);
+      .prepare(
+        'UPDATE products SET stock = CASE WHEN stock >= ? THEN stock - ? ELSE -1 END, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+      )
+      .bind(qty, qty, it.product.id);
   });
 
   let currentOrderNumber = orderNumber;
@@ -2332,7 +2334,7 @@ export async function insertOrder(db: D1Database, order: Order): Promise<Order> 
         throw new Error('Database transaction failed during order placement.');
       }
 
-      // Verify that every stock update statement actually affected exactly 1 row (stock >= qty)
+      // Verify that every stock update statement actually affected exactly 1 row
       const stockResults = batchResults.slice(1);
       let stockFailureIndex = -1;
 
@@ -2346,23 +2348,28 @@ export async function insertOrder(db: D1Database, order: Order): Promise<Order> 
       }
 
       if (stockFailureIndex !== -1) {
-        // Atomic rollback: Delete the placed order and revert any stock deductions that succeeded
-        await db.prepare('DELETE FROM orders WHERE id = ?').bind(orderId).run().catch(() => {});
+        // Atomic rollback: Delete the placed order and revert any stock deductions that succeeded in a single batch
+        const rollbackStatements: D1PreparedStatement[] = [
+          db.prepare('DELETE FROM orders WHERE id = ?').bind(orderId),
+        ];
         for (let i = 0; i < verifiedItems.length; i++) {
           if (i === stockFailureIndex) continue;
           const sRes = stockResults[i];
           const changes = sRes?.meta?.changes ?? (sRes as any)?.changes ?? sRes?.meta?.rows_written ?? 0;
           if (changes >= 1) {
             const qty = Number(verifiedItems[i].quantity) || 1;
-            await db
-              .prepare('UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-              .bind(qty, verifiedItems[i].product.id)
-              .run()
-              .catch(() => {});
+            rollbackStatements.push(
+              db
+                .prepare('UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                .bind(qty, verifiedItems[i].product.id)
+            );
           }
         }
+        await db.batch(rollbackStatements).catch((rbErr) => {
+          console.error('Rollback batch error:', rbErr);
+        });
         const failedItem = verifiedItems[stockFailureIndex];
-        throw new Error(`Insufficient stock for "${failedItem.product.title}". Only ${failedItem.product.stock} units were available and stock was claimed by a concurrent order.`);
+        throw new Error(`Insufficient stock for "${failedItem.product.title}". Stock was claimed by a concurrent order.`);
       }
 
       batchSuccess = true;
@@ -2487,43 +2494,96 @@ export async function updateOrderInD1(
     )
     .run();
 
-  // If order was cancelled, restore product stock in D1 atomically
-  if (updates.shippingStatus === 'Cancelled' && existing.shippingStatus !== 'Cancelled') {
-    if (Array.isArray(existing.items)) {
-      const restoreStmts = existing.items
-        .filter((it) => it?.product?.id && it.quantity > 0)
-        .map((it) =>
-          db
-            .prepare('UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-            .bind(it.quantity, it.product.id)
-        );
-      if (restoreStmts.length > 0) {
-        const batchResults = await db.batch(restoreStmts);
-        const failed = batchResults.find((r) => !r.success);
-        if (failed) {
-          console.error('Failed to restore product stock on order cancellation:', failed.error);
-          throw new Error('Failed to restore product stock on order cancellation.');
+  // Handle atomic stock restoration on order cancellation
+  if (updates.shippingStatus === 'Cancelled') {
+    if (existing.shippingStatus !== 'Cancelled') {
+      // Conditional atomic status transition: Only the first concurrent request transitions from non-cancelled
+      const cancelTransition = await db
+        .prepare(
+          "UPDATE orders SET shipping_status = 'Cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND shipping_status != 'Cancelled'"
+        )
+        .bind(id)
+        .run();
+
+      const transitionChanges =
+        cancelTransition.meta?.changes ??
+        (cancelTransition as any)?.changes ??
+        (cancelTransition as any)?.rows_written ??
+        0;
+
+      if (transitionChanges > 0) {
+        // Exactly ONE request wins this atomic transition. Restore stock in an atomic batch.
+        if (Array.isArray(existing.items)) {
+          const restoreStmts = existing.items
+            .filter((it) => it?.product?.id && it.quantity > 0)
+            .map((it) =>
+              db
+                .prepare('UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                .bind(it.quantity, it.product.id)
+            );
+          if (restoreStmts.length > 0) {
+            const batchResults = await db.batch(restoreStmts);
+            const failed = batchResults.find((r) => !r.success);
+            if (failed) {
+              console.error('Failed to restore product stock on order cancellation:', failed.error);
+              // Revert order status back if stock restoration failed
+              await db
+                .prepare('UPDATE orders SET shipping_status = ? WHERE id = ?')
+                .bind(existing.shippingStatus, id)
+                .run()
+                .catch(() => {});
+              throw new Error('Failed to restore product stock on order cancellation.');
+            }
+          }
         }
       }
+      // If transitionChanges === 0, a concurrent request already cancelled the order.
+      // We do NOT restore stock again!
     }
   }
 
   // If order was uncancelled (moved back from Cancelled to active), re-deduct stock
   if (existing.shippingStatus === 'Cancelled' && updates.shippingStatus && updates.shippingStatus !== 'Cancelled') {
-    if (Array.isArray(existing.items)) {
-      const deductStmts = existing.items
-        .filter((it) => it?.product?.id && it.quantity > 0)
-        .map((it) =>
-          db
-            .prepare('UPDATE products SET stock = MAX(0, stock - ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-            .bind(it.quantity, it.product.id)
-        );
-      if (deductStmts.length > 0) {
-        const batchResults = await db.batch(deductStmts);
-        const failed = batchResults.find((r) => !r.success);
-        if (failed) {
-          console.error('Failed to re-deduct product stock in database:', failed.error);
-          throw new Error('Failed to re-deduct product stock.');
+    const uncancelTransition = await db
+      .prepare(
+        "UPDATE orders SET shipping_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND shipping_status = 'Cancelled'"
+      )
+      .bind(updates.shippingStatus, id)
+      .run();
+
+    const transitionChanges =
+      uncancelTransition.meta?.changes ??
+      (uncancelTransition as any)?.changes ??
+      (uncancelTransition as any)?.rows_written ??
+      0;
+
+    if (transitionChanges > 0) {
+      if (Array.isArray(existing.items)) {
+        const deductStmts = existing.items
+          .filter((it) => it?.product?.id && it.quantity > 0)
+          .map((it) =>
+            db
+              .prepare(
+                'UPDATE products SET stock = CASE WHEN stock >= ? THEN stock - ? ELSE -1 END, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+              )
+              .bind(it.quantity, it.quantity, it.product.id)
+          );
+        if (deductStmts.length > 0) {
+          try {
+            const batchResults = await db.batch(deductStmts);
+            const failed = batchResults.find((r) => !r.success);
+            if (failed) {
+              throw new Error(failed.error || 'Failed to re-deduct stock');
+            }
+          } catch (deductErr: any) {
+            // Revert back to Cancelled if insufficient stock to un-cancel
+            await db
+              .prepare("UPDATE orders SET shipping_status = 'Cancelled' WHERE id = ?")
+              .bind(id)
+              .run()
+              .catch(() => {});
+            throw new Error('Cannot re-activate order: insufficient stock available to fulfill items.');
+          }
         }
       }
     }
@@ -2536,7 +2596,14 @@ export async function updateOrderInD1(
 
 export async function deleteOrderFromD1(db: D1Database, id: string): Promise<boolean> {
   const existing = await getOrderById(db, id);
-  if (existing && existing.shippingStatus !== 'Cancelled' && existing.shippingStatus !== 'Delivered') {
+  if (!existing) {
+    return true; // Already deleted, idempotent
+  }
+
+  const deleteStmt = db.prepare('DELETE FROM orders WHERE id = ? OR order_number = ?').bind(id, id);
+
+  // If order was not cancelled or delivered, restore stock atomically in the SAME batch with deletion
+  if (existing.shippingStatus !== 'Cancelled' && existing.shippingStatus !== 'Delivered') {
     if (Array.isArray(existing.items)) {
       const restoreStmts = existing.items
         .filter((it) => it?.product?.id && it.quantity > 0)
@@ -2546,15 +2613,18 @@ export async function deleteOrderFromD1(db: D1Database, id: string): Promise<boo
             .bind(it.quantity, it.product.id)
         );
       if (restoreStmts.length > 0) {
-        try {
-          await db.batch(restoreStmts);
-        } catch (e) {
-          console.warn('Notice: Stock restore before order deletion:', e);
+        const batchResults = await db.batch([...restoreStmts, deleteStmt]);
+        const failed = batchResults.find((r) => !r.success);
+        if (failed) {
+          console.error('Failed to atomically restore stock and delete order:', failed.error);
+          throw new Error('Failed to delete order.');
         }
+        return true;
       }
     }
   }
-  const res = await db.prepare('DELETE FROM orders WHERE id = ? OR order_number = ?').bind(id, id).run();
+
+  const res = await deleteStmt.run();
   if (!res.success) {
     console.error('Failed to delete order from database:', res.error);
     throw new Error('Failed to delete order.');
