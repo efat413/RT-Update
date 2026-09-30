@@ -1629,8 +1629,18 @@ function localApiDevPlugin(): Plugin {
             const authResult = requireDevAuth(req);
             const auth = authResult.auth;
             const isSuperAdmin = auth?.role === 'super_admin';
+            const isStaff = Boolean(auth && (auth.role === 'admin' || auth.role === 'sub_admin' || auth.role === 'staff' || isSuperAdmin));
             const canViewBuyingPrice = Boolean(auth && (isSuperAdmin || hasDevPermission(auth, 'product.view_buying_price')));
             const canViewProfit = Boolean(auth && (isSuperAdmin || hasDevPermission(auth, 'product.view_profit')));
+            const canManageProducts = Boolean(
+              auth &&
+              (isSuperAdmin ||
+                hasDevPermission(auth, 'product.create') ||
+                hasDevPermission(auth, 'product.update') ||
+                hasDevPermission(auth, 'product.view'))
+            );
+            const isPrivileged = isSuperAdmin || isStaff || canViewBuyingPrice || canViewProfit || canManageProducts;
+            const includeInactive = Boolean(isPrivileged && (url.searchParams.get('includeInactive') === 'true' || url.searchParams.get('all') === 'true'));
 
             const cat = url.searchParams.get('category');
             const search = (url.searchParams.get('search') || '').trim().toLowerCase();
@@ -1640,6 +1650,9 @@ function localApiDevPlugin(): Plugin {
             const sortBy = url.searchParams.get('sortBy');
 
             let list = [...devProducts];
+            if (!includeInactive) {
+              list = list.filter((p) => p.status !== 'inactive' && !p.isDeleted);
+            }
             if (cat && cat !== 'all') {
               const targetCategory = devCategories.find((c) => c.id === cat || c.slug === cat);
               const targetCatId = targetCategory ? targetCategory.id : cat;
@@ -1665,30 +1678,58 @@ function localApiDevPlugin(): Plugin {
             else list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
 
             const total = list.length;
+            const DEFAULT_PUBLIC_PAGE = 1;
+            const DEFAULT_PUBLIC_LIMIT = 24;
+            const MAX_PUBLIC_LIMIT = 48;
+            const MAX_ADMIN_LIMIT = 500;
+
             let pagedList = list;
             let page = 1;
             let limit = list.length;
             let totalPages = 1;
 
-            if (pageParam !== null || limitParam !== null) {
-              page = pageParam ? Math.max(1, parseInt(pageParam, 10)) : 1;
-              limit = limitParam ? Math.min(250, Math.max(1, parseInt(limitParam, 10))) : 24;
+            if (isPrivileged) {
+              if (pageParam === null && limitParam === null) {
+                // Admin dashboard fetching all products
+                page = 1;
+                limit = list.length;
+                totalPages = 1;
+                pagedList = list;
+              } else {
+                page = pageParam ? Math.max(1, parseInt(pageParam, 10) || 1) : 1;
+                const parsedLimit = limitParam ? parseInt(limitParam, 10) : 100;
+                limit = Math.min(MAX_ADMIN_LIMIT, Math.max(1, isNaN(parsedLimit) ? 100 : parsedLimit));
+                totalPages = Math.ceil(total / limit) || 1;
+                const offset = (page - 1) * limit;
+                pagedList = list.slice(offset, offset + limit);
+              }
+            } else {
+              // Public storefront request: safe default page=1, limit=24, hard cap at 48
+              page = pageParam ? Math.max(1, parseInt(pageParam, 10) || 1) : DEFAULT_PUBLIC_PAGE;
+              const parsedLimit = limitParam ? parseInt(limitParam, 10) : DEFAULT_PUBLIC_LIMIT;
+              const requestedLimit = isNaN(parsedLimit) ? DEFAULT_PUBLIC_LIMIT : parsedLimit;
+              limit = Math.min(MAX_PUBLIC_LIMIT, Math.max(1, requestedLimit));
               totalPages = Math.ceil(total / limit) || 1;
               const offset = (page - 1) * limit;
               pagedList = list.slice(offset, offset + limit);
             }
 
             const sanitized = pagedList.map((p) => sanitizeDevProduct(p, { isSuperAdmin, canViewBuyingPrice, canViewProfit }));
-            const cacheControl = (isSuperAdmin || canViewBuyingPrice || canViewProfit)
+            const cacheControl = isPrivileged
               ? 'no-store, no-cache, must-revalidate, max-age=0'
               : 'public, max-age=30, s-maxage=60, stale-while-revalidate=30';
             res.setHeader('Cache-Control', cacheControl);
             res.setHeader('Vary', 'Origin, Cookie, Authorization');
             res.statusCode = 200;
-            if (pageParam !== null || limitParam !== null) {
-              return res.end(JSON.stringify({ success: true, count: sanitized.length, total, page, limit, totalPages, products: sanitized }));
-            }
-            return res.end(JSON.stringify({ success: true, count: sanitized.length, products: sanitized }));
+            return res.end(JSON.stringify({
+              success: true,
+              count: sanitized.length,
+              total,
+              page,
+              limit,
+              totalPages,
+              products: sanitized,
+            }));
           }
           if (method === 'POST') {
             const authResult = requireDevAuth(req);

@@ -1915,19 +1915,83 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
 
         // Security check: Buying price & Unit profit strictly filtered on server!
         const authRes = await requireAuth(request, env);
-        const isSuperAdmin = Boolean(!authRes.errorResponse && authRes.auth?.role === 'super_admin');
-        const canViewBuyingPrice = Boolean(!authRes.errorResponse && authRes.auth && hasPermission(authRes.auth, 'product.view_buying_price'));
-        const canViewProfit = Boolean(!authRes.errorResponse && authRes.auth && hasPermission(authRes.auth, 'product.view_profit'));
-        const canManageProducts = Boolean(!authRes.errorResponse && authRes.auth && (hasPermission(authRes.auth, 'product.create') || hasPermission(authRes.auth, 'product.update')));
-        const isPrivileged = isSuperAdmin || canViewBuyingPrice || canViewProfit || canManageProducts;
+        const user = authRes.auth;
+        const isSuperAdmin = Boolean(!authRes.errorResponse && user?.role === 'super_admin');
+        const isStaff = Boolean(
+          !authRes.errorResponse &&
+          user &&
+          (user.role === 'admin' || user.role === 'sub_admin' || user.role === 'super_admin')
+        );
+        const canViewBuyingPrice = Boolean(!authRes.errorResponse && user && hasPermission(user, 'product.view_buying_price'));
+        const canViewProfit = Boolean(!authRes.errorResponse && user && hasPermission(user, 'product.view_profit'));
+        const canManageProducts = Boolean(
+          !authRes.errorResponse &&
+          user &&
+          (hasPermission(user, 'product.create') || hasPermission(user, 'product.update') || hasPermission(user, 'product.view'))
+        );
+        const isPrivileged = isSuperAdmin || isStaff || canViewBuyingPrice || canViewProfit || canManageProducts;
         const includeInactive = Boolean(isPrivileged && (url.searchParams.get('includeInactive') === 'true' || url.searchParams.get('all') === 'true'));
 
+        // Performance & DoS Protection: Safe pagination defaults & hard maximum limits
+        const DEFAULT_PUBLIC_PAGE = 1;
+        const DEFAULT_PUBLIC_LIMIT = 24;
+        const MAX_PUBLIC_LIMIT = 48;
+        const MAX_ADMIN_LIMIT = 500;
+
         let responsePayload: any;
-        if (pageParam !== null || limitParam !== null) {
-          const page = pageParam ? Math.max(1, parseInt(pageParam, 10)) : 1;
-          const limit = limitParam ? Math.min(250, Math.max(1, parseInt(limitParam, 10))) : 24;
-          const paginated = await getPaginatedProducts(env.DB, { category, search, featured, page, limit, sortBy, includeInactive });
-          const safeProducts = paginated.products.map((p) => sanitizeProductForRole(p, { isSuperAdmin, canViewBuyingPrice, canViewProfit }));
+
+        if (isPrivileged) {
+          // Authorized Admin / Staff Request:
+          // If no page/limit specified, return full catalog for admin product management & inventory auditing
+          if (pageParam === null && limitParam === null) {
+            const products = await getAllProducts(env.DB, { category, search, featured, sortBy, includeInactive });
+            const safeProducts = products.map((p) => sanitizeProductForRole(p, { isSuperAdmin, canViewBuyingPrice, canViewProfit }));
+            responsePayload = {
+              success: true,
+              count: safeProducts.length,
+              total: safeProducts.length,
+              page: 1,
+              limit: safeProducts.length,
+              totalPages: 1,
+              products: safeProducts,
+            };
+          } else {
+            const page = pageParam ? Math.max(1, parseInt(pageParam, 10) || 1) : 1;
+            const parsedLimit = limitParam ? parseInt(limitParam, 10) : 100;
+            const limit = Math.min(MAX_ADMIN_LIMIT, Math.max(1, isNaN(parsedLimit) ? 100 : parsedLimit));
+            const paginated = await getPaginatedProducts(env.DB, { category, search, featured, page, limit, sortBy, includeInactive });
+            const safeProducts = paginated.products.map((p) => sanitizeProductForRole(p, { isSuperAdmin, canViewBuyingPrice, canViewProfit }));
+            responsePayload = {
+              success: true,
+              count: safeProducts.length,
+              total: paginated.total,
+              page: paginated.page,
+              limit: paginated.limit,
+              totalPages: paginated.totalPages,
+              products: safeProducts,
+            };
+          }
+        } else {
+          // Public Storefront Request:
+          // Default: page=1, limit=24. Hard cap: MAX_PUBLIC_LIMIT=48.
+          // Prevents full catalog dumps and excessive database/worker/bandwidth load.
+          const page = pageParam ? Math.max(1, parseInt(pageParam, 10) || 1) : DEFAULT_PUBLIC_PAGE;
+          const parsedLimit = limitParam ? parseInt(limitParam, 10) : DEFAULT_PUBLIC_LIMIT;
+          const requestedLimit = isNaN(parsedLimit) ? DEFAULT_PUBLIC_LIMIT : parsedLimit;
+          const limit = Math.min(MAX_PUBLIC_LIMIT, Math.max(1, requestedLimit));
+
+          const paginated = await getPaginatedProducts(env.DB, {
+            category,
+            search,
+            featured,
+            page,
+            limit,
+            sortBy,
+            includeInactive: false,
+          });
+          const safeProducts = paginated.products.map((p) =>
+            sanitizeProductForRole(p, { isSuperAdmin: false, canViewBuyingPrice: false, canViewProfit: false })
+          );
           responsePayload = {
             success: true,
             count: safeProducts.length,
@@ -1937,10 +2001,6 @@ export async function handleApiRequest(request: Request, env: Env, ctx?: any): P
             totalPages: paginated.totalPages,
             products: safeProducts,
           };
-        } else {
-          const products = await getAllProducts(env.DB, { category, search, featured, sortBy, includeInactive });
-          const safeProducts = products.map((p) => sanitizeProductForRole(p, { isSuperAdmin, canViewBuyingPrice, canViewProfit }));
-          responsePayload = { success: true, count: safeProducts.length, products: safeProducts };
         }
 
         const cacheControl = isPrivileged
