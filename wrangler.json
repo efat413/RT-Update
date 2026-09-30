@@ -19,7 +19,8 @@
   ],
   "vars": {
     "APP_URL": "https://rongdhonutrade.com",
-    "RESEND_FROM_EMAIL": "support@rongdhonutrade.com"
+    "RESEND_FROM_EMAIL": "support@rongdhonutrade.com",
+    "SUPER_ADMIN_EMAILS": "cmt413uec@gmail.com"
   },
   "d1_databases": [
     {
